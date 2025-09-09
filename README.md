@@ -114,8 +114,8 @@ Same as before. The only difference is:
 
 This image uses the following software components:
 
-* Ubuntu Xenial;
-* PostgreSQL 9.5;
+* Ubuntu 22.04;
+* PostgreSQL 14;
 * Bucardo;
 * JQ.
 
