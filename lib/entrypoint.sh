@@ -168,7 +168,7 @@ add_syncs_to_bucardo() {
 
 start_bucardo() {
   echo "[CONTAINER] Starting Bucardo..."
-  run_bucardo_command "start"
+  run_bucardo_command "start --verbose"
 }
 
 bucardo_status() {
