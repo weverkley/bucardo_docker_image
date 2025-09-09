@@ -3,12 +3,14 @@ FROM ubuntu:22.04
 LABEL maintainer="lucas@vieira.io"
 LABEL version="1.1"
 
+ENV BUCARDO_VERSION=5.6.0
+ENV PG_VERSION 14
+
 RUN apt-get -y update \
     && apt-get -y upgrade
 
-RUN apt-get -y install postgresql-14 jq wget curl perl make build-essential bucardo
+RUN apt-get -y install postgresql-${PG_VERSION} jq wget curl perl make build-essential bucardo
 
-ARG BUCARDO_VERSION=5.6.0
 WORKDIR /tmp
 RUN wget -O /tmp/bucardo.tgz http://bucardo.org/downloads/Bucardo-${BUCARDO_VERSION}.tar.gz && \
     tar zxf /tmp/bucardo.tgz && \
@@ -18,11 +20,11 @@ RUN wget -O /tmp/bucardo.tgz http://bucardo.org/downloads/Bucardo-${BUCARDO_VERS
     make install && \
     rm -rf /tmp/Bucardo-${BUCARDO_VERSION}
 
-COPY etc/pg_hba.conf /etc/postgresql/14/main/
+COPY etc/pg_hba.conf /etc/postgresql/${PG_VERSION}/main/
 COPY etc/bucardorc /etc/bucardorc
 
 RUN mkdir /var/run/bucardo 
-RUN chown postgres /etc/postgresql/14/main/pg_hba.conf /etc/bucardorc /var/log/bucardo /var/run/bucardo
+RUN chown postgres /etc/postgresql/${PG_VERSION}/main/pg_hba.conf /etc/bucardorc /var/log/bucardo /var/run/bucardo
 RUN usermod -aG postgres bucardo
 
 RUN service postgresql start \
