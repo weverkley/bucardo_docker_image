@@ -1,12 +1,13 @@
 FROM ubuntu:22.04
 
-LABEL maintainer="lucas@vieira.io"
+LABEL maintainer="wever-kley@live.com"
 LABEL version="1.1"
+
+ARG BUCARDO_VERSION=5.6.0
+ARG PG_VERSION=14
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/Sao_Paulo
-ENV BUCARDO_VERSION=5.6.0
-ENV PG_VERSION 14
 
 RUN apt-get -y update
 
