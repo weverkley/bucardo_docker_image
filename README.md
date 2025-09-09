@@ -2,6 +2,12 @@
 
 Ubuntu-based Bucardo image for Docker Containers.
 
+### Default Environment Variables
+```bash
+ENV BUCARDO_VERSION=5.6.0
+ENV PG_VERSION 14
+```
+
 ### Contents
 * [How to use it (plain-text passwords)](#how-to-use-it-plain-text-passwords)
 * [How to use it (env-based passwords)](#how-to-use-it-env-based-passwords)
