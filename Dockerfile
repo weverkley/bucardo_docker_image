@@ -3,13 +3,15 @@ FROM ubuntu:22.04
 LABEL maintainer="lucas@vieira.io"
 LABEL version="1.1"
 
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/Sao_Paulo
 ENV BUCARDO_VERSION=5.6.0
 ENV PG_VERSION 14
 
-RUN apt-get -y update \
-    && apt-get -y upgrade
+RUN apt-get -y update
 
-RUN apt-get -y install postgresql-${PG_VERSION} jq wget curl perl make build-essential bucardo
+RUN apt-get -y install postgresql-${PG_VERSION} jq wget curl perl make build-essential bucardo && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /tmp
 RUN wget -O /tmp/bucardo.tgz http://bucardo.org/downloads/Bucardo-${BUCARDO_VERSION}.tar.gz && \
