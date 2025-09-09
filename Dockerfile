@@ -15,13 +15,15 @@ RUN apt-get -y install postgresql-${PG_VERSION} jq wget curl perl make build-ess
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /tmp
-RUN wget -O /tmp/bucardo.tgz http://bucardo.org/downloads/Bucardo-${BUCARDO_VERSION}.tar.gz && \
+
+RUN wget -O /tmp/bucardo.tgz https://github.com/bucardo/bucardo/archive/refs/tags/${BUCARDO_VERSION}.tar.gz && \
     tar zxf /tmp/bucardo.tgz && \
-    cd Bucardo-${BUCARDO_VERSION} && \
-    INSTALL_BUCARDODIR=/usr/bin perl Makefile.PL && \
-    make -j && \
+    cd bucardo-${BUCARDO_VERSION} && \
+    perl Makefile.PL && \
+    make && \
     make install && \
-    rm -rf /tmp/Bucardo-${BUCARDO_VERSION}
+    cd / && \
+    rm -rf /tmp/bucardo.tgz /tmp/bucardo-${BUCARDO_VERSION}
 
 COPY etc/pg_hba.conf /etc/postgresql/${PG_VERSION}/main/
 COPY etc/bucardorc /etc/bucardorc
