@@ -10,8 +10,10 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 * [Features](#features)
 * [Usage](#usage)
   * [Configuration (`bucardo.json`)](#configuration-bucardojson)
-  * Running with `docker run`
-  * Running with `docker-compose`
+  * Running the Container
+    * Using `docker run`
+    * Using `docker-compose`
+* Customizing the Build
 * Configuration Details
   * The `databases` object
   * The `syncs` object
@@ -21,7 +23,6 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 ---
 
 ## Features
-
 - **Declarative Configuration**: Define all your databases and synchronization tasks in a single `bucardo.json` file.
 - **Environment Variable Support**: Keep your database passwords secure by loading them from environment variables.
 - **Flexible Sync Definitions**: Sync all tables from a source (`herd`) or specify a list of tables (`tables`).
@@ -31,11 +32,7 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 
 ### Configuration (`bucardo.json`)
 
-1. Create a folder;
-
-2. Create a "bucardo.json" inside this folder;
-
-3. Fill the "bucardo.json" file following this example:
+First, create a `bucardo.json` configuration file. The container will mount and read this file on startup.
 
   ```jsonc
   {
