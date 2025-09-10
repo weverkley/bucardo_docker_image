@@ -1,10 +1,16 @@
 FROM ubuntu:22.04
 
-LABEL maintainer="wever-kley@live.com"
-LABEL version="1.1"
-
 ARG BUCARDO_VERSION=5.6.0
 ARG PG_VERSION=14
+
+LABEL \
+    maintainer="Wever Kley <wever-kley@live.com>" \
+    org.opencontainers.image.title="Bucardo Docker Image" \
+    org.opencontainers.image.description="An Ubuntu-based Docker image for Bucardo, a PostgreSQL replication system." \
+    org.opencontainers.image.authors="Wever Kley <wever-kley@live.com>" \
+    org.opencontainers.image.source="https://github.com/wever-kley/bucardo_docker_image" \
+    org.opencontainers.image.documentation="https://github.com/wever-kley/bucardo_docker_image/blob/main/README.md" \
+    org.opencontainers.image.licenses="Apache-2.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/Sao_Paulo
