@@ -34,19 +34,22 @@ ENV PG_VERSION 14
         "dbname": "example_db",
         "host": "host0.example.com",
         "user": "example_user",
-        "pass": "secret"
+        "pass": "secret",
+        "port": 5432
       },{
         "id": 1,
         "dbname": "example_db",
         "host": "host1.example.com",
         "user": "example_user",
-        "pass": "secret"
+        "pass": "secret",
+        "port": 5432
       },{
         "id": 2,
         "dbname": "example_db",
         "host": "host3.example.com",
         "user": "example_user",
-        "pass": "secret"
+        "pass": "secret",
+        "port": 5432
       }],
     "syncs" : [
       {
