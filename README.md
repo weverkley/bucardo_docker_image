@@ -86,7 +86,7 @@ ENV PG_VERSION 14
   ```bash
   docker run --name my_own_bucardo_container \
     -v <bucardo.json dir>:/media/bucardo \
-    -d plgr/bucardo
+    -d weverkley/bucardo
   ```
 
 5. Check bucardo's status:
@@ -107,7 +107,7 @@ Same as before. The only difference is:
   docker run --name my_own_bucardo_container \
       -v <bucardo.json dir>:/media/bucardo \
       -e BUCARDO_DB3="secret" \
-      -d plgr/bucardo
+      -d weverkley/bucardo
   ```
 
 ## Acknowlegments
