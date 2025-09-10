@@ -1,22 +1,35 @@
 # Bucardo
 
-Ubuntu-based Bucardo image for Docker Containers.
+This repository provides a Docker image for [Bucardo](https://bucardo.org/), a powerful asynchronous multi-master replication system for PostgreSQL. The image is based on Ubuntu and is automatically built and published to Docker Hub.
 
-### Default Environment Variables
-```bash
-ENV BUCARDO_VERSION=5.6.0
-ENV PG_VERSION 14
-```
+**Docker Hub:** [weverkley/bucardo](https://hub.docker.com/r/weverkley/bucardo)
 
-### Contents
-* [How to use it (plain-text passwords)](#how-to-use-it-plain-text-passwords)
-* [How to use it (env-based passwords)](#how-to-use-it-env-based-passwords)
-* [Acknowlegments](#acknowlegments)
+[![Docker Image CI](https://github.com/wever-kley/bucardo_docker_image/actions/workflows/docker-image.yml/badge.svg)](https://github.com/wever-kley/bucardo_docker_image/actions/workflows/docker-image.yml)
+
+## Table of Contents
+* [Features](#features)
+* [Usage](#usage)
+  * [Configuration (`bucardo.json`)](#configuration-bucardojson)
+  * Running with `docker run`
+  * Running with `docker-compose`
+* Configuration Details
+  * The `databases` object
+  * The `syncs` object
+* Acknowledgements
 * [Copyright and License](#copyright-and-license)
 
 ---
 
-## How to use it (plain-text passwords)
+## Features
+
+- **Declarative Configuration**: Define all your databases and synchronization tasks in a single `bucardo.json` file.
+- **Environment Variable Support**: Keep your database passwords secure by loading them from environment variables.
+- **Flexible Sync Definitions**: Sync all tables from a source (`herd`) or specify a list of tables (`tables`).
+- **Automated Setup**: The container automatically configures Bucardo on startup based on your JSON file.
+
+## Usage
+
+### Configuration (`bucardo.json`)
 
 1. Create a folder;
 
@@ -24,9 +37,7 @@ ENV PG_VERSION 14
 
 3. Fill the "bucardo.json" file following this example:
 
-  ```json
-  // bucardo.json
-
+  ```jsonc
   {
     "databases":[
       {
@@ -55,12 +66,12 @@ ENV PG_VERSION 14
       {
         "sources": [3],
         "targets": [1,2],
-        "tables": "client",
+        "herd": "all_from_source",
         "onetimecopy": 1
       },{
         "sources": [1,2],
         "targets": [3],
-        "tables": "product,order",
+        "tables": "product, order",
         "onetimecopy": 0
       }
     ]
@@ -77,7 +88,9 @@ ENV PG_VERSION 14
 
   * Each entity inside the *sources* and *targets* arrays represents an *ID* referring to the databases described beforehand;
 
-  * The other attribute required is the syncs' *table lists*. A *table list* is a String containing the tables sync'd by that sync, separated by a comma and a space, as in the example above.
+  * You must define what to sync. You can either use `herd` or `tables`:
+    - `herd`: Provide a string with a name for the herd. All tables from the first source database will be added to this herd and synchronized.
+    - `tables`: A string containing a comma-separated list of tables to be synchronized.
 
   * [Onetimecopy](https://bucardo.org/wiki/Onetimecopy) is used for full table copy:
     - 0 No full copy is done
@@ -124,6 +137,6 @@ This image uses the following software components:
 
 ## Copyright and License
 
-This project is copyright 2017 Lucas Vieira [lucas@vieira.io](mailto:lucas@vieira.io).<br />
+This project is copyright 2025 Wever Kley [wever-kley@live.com](mailto:wever-kley@live.com).<br />
 Licensed under Apache 2.0 License.<br />
 Check the license file for details.

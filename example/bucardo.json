@@ -33,6 +33,11 @@
       "targets": [0],
       "tables": "product,order",
       "onetimecopy": 0
+    },{
+      "sources": [0],
+      "targets": [1],
+      "herd": "all_database_tables",
+      "onetimecopy": 1
     }
   ]
 }
