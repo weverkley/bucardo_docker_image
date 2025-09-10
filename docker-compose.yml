@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  bucardo:
+    build: .
+    container_name: bucardo_app
+    volumes:
+      - ./bucardo.json:/media/bucardo/bucardo.json:ro
+    # environment:
+    #   # Passwords for databases defined in bucardo.json with "pass": "env"
+    #   - BUCARDO_DB1=testpass
+    #   - BUCARDO_DB2=testpass
+    networks:
+      - bucardo-net
+
+networks:
+  bucardo-net:
+    driver: bridge

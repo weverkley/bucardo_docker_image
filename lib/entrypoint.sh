@@ -123,7 +123,8 @@ add_databases_to_bucardo() {
     run_bucardo_command "add db db$db_id --force dbname=\"$(db_attr $db_index dbname string)\" \
                                 user=\"$(db_attr $db_index user string)\" \
                                 pass=\"$db_pass\" \
-                                host=\"$(db_attr $db_index host string)\"" || exit 2
+                                host=\"$(db_attr $db_index host string)\" \
+                                port=\"$(db_attr $db_index port integer)\"" || exit 2
     db_index=$(expr $db_index + 1)
   done
 }

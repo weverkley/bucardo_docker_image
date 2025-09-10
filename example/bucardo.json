@@ -5,19 +5,22 @@
       "dbname": "example_db",
       "host": "host.example.com",
       "user": "example_user",
-      "pass": "secret"
+      "pass": "secret",
+      "port": 5432
     },{
       "id": 1,
       "dbname": "example_db",
       "host": "host.example.com",
       "user": "example_user",
-      "pass": "secret"
+      "pass": "secret",
+      "port": 5432
     },{
       "id": 2,
       "dbname": "example_db",
       "host": "host.example.com",
       "user": "example_user",
-      "pass": "secret"
+      "pass": "secret",
+      "port": 5432
     }],
   "syncs" : [
     {
