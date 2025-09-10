@@ -1,17 +1,5 @@
-#/bin/bash
+#!/bin/bash
 
-# Entrypoint Script
-# Author: Lucas Vieira < lucas at vieira dot io >
-# Version: 1.0
-# January 31th, 2017
-
-# ~ #
-
-# TODO: write password validator
-# TODO: DRY db_attr and sync_attr
-# TODO: DRY validators
-
-# Exits with an error when there are any invalid chars
 check_invalid_chars() {
   local attr_name=$1
   local invalid_chars=$2
@@ -21,7 +9,6 @@ check_invalid_chars() {
   fi
 }
 
-# An Integer is only allowed to be an Integer
 validate_integer_attr() {
   local attr_name=$1
   local string_attr=$2
@@ -29,8 +16,6 @@ validate_integer_attr() {
   check_invalid_chars $attr_name $invalid_chars
 }
 
-# A String is allowed to have alphanumeric chars,
-# dots, dashes, and underscores.
 validate_string_attr() {
   local attr_name=$1
   local string_attr=$2
@@ -39,8 +24,6 @@ validate_string_attr() {
   check_invalid_chars $attr_name $invalid_chars
 }
 
-# A List is allowed to have have alphanumeric chars,
-# dots, dashes, underscores, and commas.
 validate_list_attr() {
   local attr_name=$1
   local string_attr=$2
@@ -90,12 +73,11 @@ sync_attr() {
   echo $value
 }
 
-#First validate onetimecopy is an integer and then validate if it's 0,1 or 2
 one_time_copy_attr() {
   local sync_index=$1
   local value=$(sync_attr $sync_index onetimecopy integer)
-  local invalid_chars=$(echo $string_attr | sed -e "s/[0,1,2]//")
-  check_invalid_chars $value $invalid_chars
+  local invalid_chars=$(echo $value | sed -e "s/[0,1,2]//g")
+  check_invalid_chars onetimecopy $invalid_chars
   echo $value
 }
 
@@ -112,19 +94,29 @@ load_db_pass() {
 
 add_databases_to_bucardo() {
   echo "[CONTAINER] Adding databases to Bucardo..."
-  local db_id db_pass
+  local db_id db_pass db_port
   local db_index=0
-  NUM_DBS=$(jq '.databases' /media/bucardo/bucardo.json | grep dbname | wc -l)
+  NUM_DBS=$(jq '.databases | length' /media/bucardo/bucardo.json)
   while [[ $db_index -lt $NUM_DBS ]]; do
     echo "[CONTAINER] Adding db $db_index"
     db_id=$(db_attr $db_index id integer)
     db_pass=$(load_db_pass $db_index)
+
     run_bucardo_command "del db db$db_id --force"
-    run_bucardo_command "add db db$db_id --force dbname=\"$(db_attr $db_index dbname string)\" \
-                                user=\"$(db_attr $db_index user string)\" \
-                                pass=\"$db_pass\" \
-                                host=\"$(db_attr $db_index host string)\" \
-                                port=\"$(db_attr $db_index port integer)\"" || exit 2
+
+    local add_db_cmd="add db db$db_id --force"
+    add_db_cmd="$add_db_cmd dbname=\"$(db_attr $db_index dbname string)\""
+    add_db_cmd="$add_db_cmd user=\"$(db_attr $db_index user string)\""
+    add_db_cmd="$add_db_cmd pass=\"$db_pass\""
+    add_db_cmd="$add_db_cmd host=\"$(db_attr $db_index host string)\""
+
+    db_port=$(db_attr $db_index port integer)
+
+    if [[ "$db_port" != "null" ]]; then
+      add_db_cmd="$add_db_cmd port=\"$db_port\""
+    fi
+
+    run_bucardo_command "$add_db_cmd" || exit 2
     db_index=$(expr $db_index + 1)
   done
 }
@@ -153,19 +145,39 @@ db_sync_string() {
 
 add_syncs_to_bucardo() {
   local sync_index=0
-  local num_syncs=$(jq '.syncs' /media/bucardo/bucardo.json | grep tables | wc -l)
+  local num_syncs=$(jq '.syncs | length' /media/bucardo/bucardo.json)
   while [[ $sync_index -lt $num_syncs ]]; do
     echo "[CONTAINER] Adding sync$sync_index to Bucardo..."
     db_sync_string $sync_index
     local one_time_copy="$(one_time_copy_attr $sync_index)"
+    
     run_bucardo_command "del sync sync$sync_index"
-    run_bucardo_command "add sync sync$sync_index \
-                         dbs=$DB_STRING \
-                         tables=$(sync_attr $sync_index tables list) \
-                         onetimecopy=$one_time_copy" || exit 2
+
+    local herd_name=$(sync_attr $sync_index herd string)
+
+    if [[ "$herd_name" != "null" ]]; then
+      echo "[CONTAINER] Using herd: $herd_name"
+      local source_db_id=$(sync_attr $sync_index "sources[0]" integer)
+      
+      run_bucardo_command "del herd $herd_name"
+      run_bucardo_command "add herd $herd_name"
+      run_bucardo_command "add all tables --herd=$herd_name db=db$source_db_id"
+
+      run_bucardo_command "add sync sync$sync_index \
+                           herd=$herd_name \
+                           dbs=$DB_STRING \
+                           onetimecopy=$one_time_copy" || exit 2
+    else
+      echo "[CONTAINER] Using table list"
+      run_bucardo_command "add sync sync$sync_index \
+                           dbs=$DB_STRING \
+                           tables=$(sync_attr $sync_index tables list) \
+                           onetimecopy=$one_time_copy" || exit 2
+    fi
     sync_index=$(expr $sync_index + 1)
   done
 }
+
 
 start_bucardo() {
   echo "[CONTAINER] Starting Bucardo..."
@@ -177,7 +189,7 @@ bucardo_status() {
   local run=true
   while [[ $run ]]; do
     run_bucardo_command "status"
-    sleep 10
+    sleep 15
   done
 }
 
