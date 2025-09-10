@@ -4,8 +4,6 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 
 **Docker Hub:** [weverkley/bucardo](https://hub.docker.com/r/weverkley/bucardo)
 
-[![Docker Image CI](https://github.com/wever-kley/bucardo_docker_image/actions/workflows/docker-image.yml/badge.svg)](https://github.com/wever-kley/bucardo_docker_image/actions/workflows/docker-image.yml)
-
 ## Table of Contents
 * [Features](#features)
 * [Usage](#usage)
