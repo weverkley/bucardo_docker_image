@@ -239,7 +239,7 @@ func streamBucardoLog() {
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
 	log.Println("[CONTAINER] Starting Bucardo...")
-	if err := runBucardoCommand("start", "--verbose"); err != nil {
+	if err := runBucardoCommand("start"); err != nil {
 		log.Fatalf("Failed to start bucardo: %v", err)
 	}
 }
