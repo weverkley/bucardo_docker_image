@@ -41,24 +41,29 @@ type Sync struct {
 }
 
 // runCommand executes a shell command and prints its output.
-func runCommand(name string, arg ...string) error {
+// The optional logCmd allows for a custom command string for logging.
+func runCommand(logCmd, name string, arg ...string) error {
 	cmd := exec.Command(name, arg...)
+	if logCmd == "" {
+		logCmd = cmd.String()
+	}
+	log.Printf("Running command: %s", logCmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	log.Printf("Running command: %s", cmd.String())
 	return cmd.Run()
 }
 
 // runBucardoCommand executes a bucardo command as the 'postgres' user.
 func runBucardoCommand(args ...string) error {
-	fullArgs := []string{"-", "postgres", "-c", fmt.Sprintf("bucardo %s", strings.Join(args, " "))}
-	return runCommand("su", fullArgs...)
+	bucardoCmdStr := fmt.Sprintf("bucardo %s", strings.Join(args, " "))
+	fullArgs := []string{"-", "postgres", "-c", bucardoCmdStr}
+	return runCommand(bucardoCmdStr, "su", fullArgs...)
 }
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
 func startPostgres() {
 	log.Println("[CONTAINER] Starting PostgreSQL...")
-	if err := runCommand("service", "postgresql", "start"); err != nil {
+	if err := runCommand("", "service", "postgresql", "start"); err != nil {
 		log.Fatalf("Failed to start postgresql service: %v", err)
 	}
 
