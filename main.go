@@ -21,6 +21,7 @@ const bucardoConfigPath = "/media/bucardo/bucardo.json"
 type BucardoConfig struct {
 	Databases []Database `json:"databases"`
 	Syncs     []Sync     `json:"syncs"`
+	LogLevel  string     `json:"log_level,omitempty"`
 }
 
 // Database defines a database connection for Bucardo
@@ -280,13 +281,26 @@ func monitorBucardo() {
 	for {
 		select {
 		case <-ticker.C:
-			// It's okay if this command fails, we just log it.
-			// runBucardoCommand("status")
+			// log.Println("[CONTAINER] Checking Bucardo status...")
+			// if err := runBucardoCommand("status"); err != nil {
+			// 	log.Printf("[WARNING] 'bucardo status' command failed: %v", err)
+			// }
 
 		case sig := <-sigs:
 			log.Printf("Received signal %s, shutting down.", sig)
 			stopBucardo()
 			return
+		}
+	}
+}
+
+// setLogLevel sets the Bucardo logging level if specified in the config.
+func setLogLevel(config *BucardoConfig) {
+	if config.LogLevel != "" {
+		log.Printf("[CONTAINER] Setting Bucardo log level to: %s", config.LogLevel)
+		if err := runBucardoCommand("set", fmt.Sprintf("log_level=%s", config.LogLevel)); err != nil {
+			// Log as a warning as Bucardo can still run with the default log level.
+			log.Printf("[WARNING] Failed to set log_level: %v", err)
 		}
 	}
 }
@@ -304,6 +318,7 @@ func main() {
 	}
 
 	startPostgres()
+	setLogLevel(config)
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
