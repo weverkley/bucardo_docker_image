@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const bucardoLogPath = "/var/log/bucardo/log.bucardo"
+
 const bucardoConfigPath = "/media/bucardo/bucardo.json"
 
 // BucardoConfig represents the structure of bucardo.json
@@ -205,6 +207,26 @@ func addSyncsToBucardo(config *BucardoConfig) {
 	}
 }
 
+// streamBucardoLog tails the Bucardo log file and streams it to stdout.
+func streamBucardoLog() {
+	// Wait a moment for the log file to be created by Bucardo.
+	time.Sleep(2 * time.Second)
+
+	// Use `tail -f` to stream the log file.
+	cmd := exec.Command("tail", "-F", bucardoLogPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("[CONTAINER] Streaming Bucardo log file: %s", bucardoLogPath)
+	if err := cmd.Start(); err != nil {
+		log.Printf("[WARNING] Could not start streaming Bucardo log file: %v", err)
+		return
+	}
+
+	// We don't call cmd.Wait() here because we want this to run in the background
+	// for the life of the container. The process will be terminated when the container stops.
+}
+
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
 	log.Println("[CONTAINER] Starting Bucardo...")
@@ -237,7 +259,8 @@ func stopBucardo() {
 
 // monitorBucardo continuously prints the Bucardo status.
 func monitorBucardo() {
-	log.Println("[CONTAINER] Now, some status for you.")
+	go streamBucardoLog()
+
 	// Set up a channel to listen for termination signals.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -249,7 +272,8 @@ func monitorBucardo() {
 		select {
 		case <-ticker.C:
 			// It's okay if this command fails, we just log it.
-			runBucardoCommand("status")
+			// runBucardoCommand("status")
+
 		case sig := <-sigs:
 			log.Printf("Received signal %s, shutting down.", sig)
 			stopBucardo()
