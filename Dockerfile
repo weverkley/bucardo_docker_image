@@ -1,3 +1,8 @@
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY main.go .
+RUN go build -o /entrypoint main.go
+
 FROM ubuntu:22.04
 
 ARG BUCARDO_VERSION=5.6.0
@@ -41,9 +46,9 @@ RUN usermod -aG postgres bucardo
 RUN service postgresql start \
     && su - postgres -c "bucardo install --batch"
 
-COPY lib/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY --from=builder /entrypoint /entrypoint
 
 WORKDIR /media/bucardo
 
-CMD ["/bin/bash","-c","/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint"]
+CMD []
