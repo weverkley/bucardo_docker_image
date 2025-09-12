@@ -35,11 +35,12 @@ type Database struct {
 
 // Sync defines a Bucardo synchronization task
 type Sync struct {
-	Sources     []int  `json:"sources"`
-	Targets     []int  `json:"targets"`
-	Herd        string `json:"herd,omitempty"`
-	Tables      string `json:"tables,omitempty"`
-	Onetimecopy int    `json:"onetimecopy"`
+	Sources        []int  `json:"sources"`
+	Targets        []int  `json:"targets"`
+	Herd           string `json:"herd,omitempty"`
+	Tables         string `json:"tables,omitempty"`
+	Onetimecopy    int    `json:"onetimecopy"`
+	StrictChecking *bool  `json:"strict_checking,omitempty"`
 }
 
 // runCommand executes a shell command and prints its output.
@@ -178,12 +179,16 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			runBucardoCommand("add", "herd", sync.Herd)
 			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 
-			if err := runBucardoCommand(
+			args := []string{
 				"add", "sync", syncName,
 				fmt.Sprintf("herd=%s", sync.Herd),
 				fmt.Sprintf("dbs=%s", dbsArg),
 				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
-			); err != nil {
+			}
+			if sync.StrictChecking != nil {
+				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
+			}
+			if err := runBucardoCommand(args...); err != nil {
 				log.Fatalf("Failed to add herd-based sync %s: %v", syncName, err)
 			}
 		} else if sync.Tables != "" {
@@ -193,12 +198,16 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				log.Fatalf("Error in sync '%s': The 'tables' field cannot be '%s'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName, trimmedTables)
 			}
 
-			if err := runBucardoCommand(
+			args := []string{
 				"add", "sync", syncName,
 				fmt.Sprintf("dbs=%s", dbsArg),
 				fmt.Sprintf("tables=%s", sync.Tables),
 				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
-			); err != nil {
+			}
+			if sync.StrictChecking != nil {
+				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
+			}
+			if err := runBucardoCommand(args...); err != nil {
 				log.Fatalf("Failed to add table-based sync %s: %v", syncName, err)
 			}
 		} else {

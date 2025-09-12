@@ -91,6 +91,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
     - 0 No full copy is done
     - 1 A full table copy is always performed
     - 2 A full copy is done in case the destination table is empty
+  
+  * `strict_checking` (optional): A boolean (`true` or `false`). If set to `false`, Bucardo will not perform strict schema validation, allowing for differences in column order between source and target tables. Defaults to `true` if not specified.
 
 4. Start the container:
 
