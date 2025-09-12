@@ -186,6 +186,11 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			}
 		} else if sync.Tables != "" {
 			log.Println("[CONTAINER] Using table list")
+			trimmedTables := strings.TrimSpace(sync.Tables)
+			if trimmedTables == "all" || trimmedTables == "*" {
+				log.Fatalf("Error in sync '%s': The 'tables' field cannot be '%s'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName, trimmedTables)
+			}
+
 			if err := runBucardoCommand(
 				"add", "sync", syncName,
 				fmt.Sprintf("dbs=%s", dbsArg),
