@@ -24,6 +24,8 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 - **Declarative Configuration**: Define all your databases and synchronization tasks in a single `bucardo.json` file.
 - **Environment Variable Support**: Keep your database passwords secure by loading them from environment variables.
 - **Flexible Sync Definitions**: Sync all tables from a source (`herd`) or specify a list of tables (`tables`).
+- **Detailed Logging**: Control Bucardo's log verbosity to get real-time insight into replication.
+- **Run-Once Mode**: An option to have the container exit automatically after a successful sync, perfect for batch jobs.
 - **Automated Setup**: The container automatically configures Bucardo on startup based on your JSON file.
 
 ## Usage
@@ -34,6 +36,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   ```jsonc
   {
+    "log_level": "VERBOSE",
+    "exit_on_complete": false,
     "databases":[
       {
         "id": 3,
@@ -93,6 +97,12 @@ First, create a `bucardo.json` configuration file. The container will mount and 
     - 2 A full copy is done in case the destination table is empty
   
   * `strict_checking` (optional): A boolean (`true` or `false`). If set to `false`, Bucardo will not perform strict schema validation, allowing for differences in column order between source and target tables. Defaults to `true` if not specified.
+
+  * `log_level` (optional): A string to control Bucardo's logging verbosity. Set to `"VERBOSE"` or `"DEBUG"` to get detailed, real-time logs about sync activity. This is highly recommended for monitoring and troubleshooting.
+
+  * `exit_on_complete` (optional): A boolean (`true` or `false`). When set to `true`, the container will perform a single synchronization and then automatically shut down and exit. This is ideal for "run-once" or batch-style replication tasks.
+    - **Note:** This feature requires `log_level` to be set to `VERBOSE` or `DEBUG` to detect sync completion.
+
 
 4. Start the container:
 

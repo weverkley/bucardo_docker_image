@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,9 +20,10 @@ const bucardoConfigPath = "/media/bucardo/bucardo.json"
 
 // BucardoConfig represents the structure of bucardo.json
 type BucardoConfig struct {
-	Databases []Database `json:"databases"`
-	Syncs     []Sync     `json:"syncs"`
-	LogLevel  string     `json:"log_level,omitempty"`
+	Databases      []Database `json:"databases"`
+	Syncs          []Sync     `json:"syncs"`
+	LogLevel       string     `json:"log_level,omitempty"`
+	ExitOnComplete *bool      `json:"exit_on_complete,omitempty"`
 }
 
 // Database defines a database connection for Bucardo
@@ -294,6 +296,45 @@ func monitorBucardo() {
 	}
 }
 
+// monitorForCompletionAndExit tails the Bucardo log, waits for a completion message,
+// and then stops Bucardo and exits the container.
+func monitorForCompletionAndExit() {
+	log.Println("[CONTAINER] 'exit_on_complete' is true. Will exit after first successful sync.")
+
+	// Wait a moment for the log file to be created by Bucardo.
+	time.Sleep(2 * time.Second)
+
+	cmd := exec.Command("tail", "-F", bucardoLogPath)
+
+	// Get a pipe to the command's stdout
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatalf("[ERROR] Could not create pipe for tail command: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("[ERROR] Could not start tail command: %v", err)
+	}
+
+	// Read from the pipe line by line
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Println(line) // Print the log line to the container's stdout
+
+		if strings.Contains(line, "All databases committed") {
+			log.Println("[CONTAINER] Completion message 'All databases committed' detected. Shutting down.")
+			stopBucardo()
+			return // Exit the function, which will cause main() to terminate.
+		}
+	}
+
+	// If the loop finishes (e.g., tail command exits), log it.
+	log.Println("[CONTAINER] Log streaming finished.")
+	cmd.Wait()
+}
+
 // setLogLevel sets the Bucardo logging level if specified in the config.
 func setLogLevel(config *BucardoConfig) {
 	if config.LogLevel != "" {
@@ -322,5 +363,11 @@ func main() {
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
-	monitorBucardo()
+
+	if config.ExitOnComplete != nil && *config.ExitOnComplete {
+		monitorForCompletionAndExit()
+		log.Println("[CONTAINER] Process finished.")
+	} else {
+		monitorBucardo()
+	}
 }
