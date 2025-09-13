@@ -26,6 +26,7 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 - **Flexible Sync Definitions**: Sync all tables from a source (`herd`) or specify a list of tables (`tables`).
 - **Detailed Logging**: Control Bucardo's log verbosity to get real-time insight into replication.
 - **Run-Once Mode**: An option to have the container exit automatically after a successful sync, perfect for batch jobs.
+- **Timeout for Run-Once**: Set a timeout for run-once mode to prevent jobs from running indefinitely.
 - **Automated Setup**: The container automatically configures Bucardo on startup based on your JSON file.
 
 ## Usage
@@ -38,6 +39,7 @@ First, create a `bucardo.json` configuration file. The container will mount and 
   {
     "log_level": "VERBOSE",
     "exit_on_complete": false,
+    "exit_on_complete_timeout": 300,
     "databases":[
       {
         "id": 3,
@@ -102,6 +104,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   * `exit_on_complete` (optional): A boolean (`true` or `false`). When set to `true`, the container will perform a single synchronization and then automatically shut down and exit. This is ideal for "run-once" or batch-style replication tasks.
     - **Note:** This feature requires `log_level` to be set to `VERBOSE` or `DEBUG` to detect sync completion.
+
+  * `exit_on_complete_timeout` (optional): An integer representing seconds. Use this with `exit_on_complete: true`. If the sync does not complete within this time, the container will exit with an error. This prevents failed syncs from running forever.
 
 
 4. Start the container:

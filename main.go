@@ -20,10 +20,11 @@ const bucardoConfigPath = "/media/bucardo/bucardo.json"
 
 // BucardoConfig represents the structure of bucardo.json
 type BucardoConfig struct {
-	Databases      []Database `json:"databases"`
-	Syncs          []Sync     `json:"syncs"`
-	LogLevel       string     `json:"log_level,omitempty"`
-	ExitOnComplete *bool      `json:"exit_on_complete,omitempty"`
+	Databases             []Database `json:"databases"`
+	Syncs                 []Sync     `json:"syncs"`
+	LogLevel              string     `json:"log_level,omitempty"`
+	ExitOnComplete        *bool      `json:"exit_on_complete,omitempty"`
+	ExitOnCompleteTimeout *int       `json:"exit_on_complete_timeout,omitempty"`
 }
 
 // Database defines a database connection for Bucardo
@@ -298,8 +299,10 @@ func monitorBucardo() {
 
 // monitorForCompletionAndExit tails the Bucardo log, waits for a completion message,
 // and then stops Bucardo and exits the container.
-func monitorForCompletionAndExit() {
+func monitorForCompletionAndExit(config *BucardoConfig) {
 	log.Println("[CONTAINER] 'exit_on_complete' is true. Will exit after first successful sync.")
+
+	var timeoutChannel <-chan time.Time
 
 	// Wait a moment for the log file to be created by Bucardo.
 	time.Sleep(2 * time.Second)
@@ -317,22 +320,46 @@ func monitorForCompletionAndExit() {
 		log.Fatalf("[ERROR] Could not start tail command: %v", err)
 	}
 
-	// Read from the pipe line by line
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Println(line) // Print the log line to the container's stdout
-
-		if strings.Contains(line, "All databases committed") {
-			log.Println("[CONTAINER] Completion message 'All databases committed' detected. Shutting down.")
-			stopBucardo()
-			return // Exit the function, which will cause main() to terminate.
-		}
+	// Set up the timeout if specified
+	if config.ExitOnCompleteTimeout != nil && *config.ExitOnCompleteTimeout > 0 {
+		timeoutDuration := time.Duration(*config.ExitOnCompleteTimeout) * time.Second
+		log.Printf("[CONTAINER] Setting a timeout of %v for sync completion.", timeoutDuration)
+		timeoutChannel = time.After(timeoutDuration)
 	}
 
-	// If the loop finishes (e.g., tail command exits), log it.
-	log.Println("[CONTAINER] Log streaming finished.")
-	cmd.Wait()
+	// Channel to receive log lines
+	lineChan := make(chan string)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lineChan <- scanner.Text()
+		}
+		// If the loop finishes (e.g., tail command exits), close the channel.
+		close(lineChan)
+	}()
+
+	// Read from the pipe line by line
+	for {
+		select {
+		case line, ok := <-lineChan:
+			if !ok {
+				log.Println("[CONTAINER] Log streaming finished unexpectedly.")
+				cmd.Wait()
+				return
+			}
+			fmt.Println(line) // Print the log line to the container's stdout
+
+			if strings.Contains(line, "All databases committed") {
+				log.Println("[CONTAINER] Completion message 'All databases committed' detected. Shutting down.")
+				stopBucardo()
+				return // Success
+			}
+		case <-timeoutChannel:
+			log.Println("[ERROR] Timeout reached while waiting for sync completion. Shutting down.")
+			stopBucardo()
+			os.Exit(1) // Exit with a non-zero status code to indicate failure
+		}
+	}
 }
 
 // setLogLevel sets the Bucardo logging level if specified in the config.
@@ -365,7 +392,7 @@ func main() {
 	startBucardo()
 
 	if config.ExitOnComplete != nil && *config.ExitOnComplete {
-		monitorForCompletionAndExit()
+		monitorForCompletionAndExit(config)
 		log.Println("[CONTAINER] Process finished.")
 	} else {
 		monitorBucardo()
