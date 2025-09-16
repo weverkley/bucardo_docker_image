@@ -216,6 +216,10 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				fmt.Sprintf("dbs=%s", dbsArg),
 				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
 			}
+			if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
+				// Ensure the sync does not persist after its run
+				args = append(args, "stayalive=0", "kidsalive=0")
+			}
 			if sync.StrictChecking != nil {
 				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
 			}
@@ -236,6 +240,10 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				fmt.Sprintf("dbs=%s", dbsArg),
 				fmt.Sprintf("tables=%s", sync.Tables),
 				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
+			}
+			if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
+				// Ensure the sync does not persist after its run
+				args = append(args, "stayalive=0", "kidsalive=0")
 			}
 			if sync.StrictChecking != nil {
 				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
@@ -363,7 +371,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	var timeoutChannel <-chan time.Time
 
 	// Wait a moment for the log file to be created by Bucardo.
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	cmd := exec.Command("tail", "-F", bucardoLogPath)
 
@@ -416,11 +424,11 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 			}
 			fmt.Println(line) // Print the log line to the container's stdout
 
-			// Check for individual sync completion message, e.g., "KID (sync0) Ending sync, status: good"
-			if strings.Contains(line, "Ending sync, status: good") {
+			// Check for the completion message from the logs, e.g., "KID (sync0) Kid ... exiting at cleanup_kid.  Reason: Normal exit"
+			if strings.Contains(line, "exiting at cleanup_kid") && strings.Contains(line, "Reason: Normal exit") {
 				for syncName := range runOnceSyncs {
 					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) {
-						log.Printf("[CONTAINER] Completion message for sync '%s' detected. Stopping sync.", syncName)
+						log.Printf("[CONTAINER] Completion message for sync '%s' detected.", syncName)
 						if err := runBucardoCommand("stop", syncName); err != nil {
 							log.Printf("[WARNING] Failed to stop sync %s: %v", syncName, err)
 						}
