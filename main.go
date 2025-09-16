@@ -77,9 +77,13 @@ func startPostgres() {
 	}
 
 	log.Println("[CONTAINER] Waiting for Bucardo to be ready...")
-	for {
+	// Wait for Bucardo to be ready, with a timeout.
+	const readinessTimeout = 2 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), readinessTimeout)
+	defer cancel()
+
+	for ctx.Err() == nil {
 		// We check the output of `bucardo status` to see if it's ready.
-		// We don't need to check the error here, as it will fail until postgres is fully up.
 		cmd := exec.Command("su", "-", "postgres", "-c", "bucardo status")
 		if err := cmd.Run(); err == nil {
 			log.Println("[CONTAINER] Bucardo is ready.")
@@ -87,6 +91,7 @@ func startPostgres() {
 		}
 		time.Sleep(5 * time.Second)
 	}
+	log.Fatalf("[ERROR] Bucardo did not become ready within %v.", readinessTimeout)
 }
 
 // loadConfig reads and parses the bucardo.json file.
@@ -188,7 +193,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		syncName := fmt.Sprintf("sync%d", i)
 		log.Printf("[CONTAINER] Adding %s to Bucardo...", syncName)
 
-		runBucardoCommand("del", "sync", syncName)
+		runBucardoCommand("del", "sync", syncName, "--force")
 
 		var dbStrings []string
 		for _, sourceID := range sync.Sources {
@@ -199,6 +204,13 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		}
 		dbsArg := strings.Join(dbStrings, ",")
 
+		// Base arguments for adding a sync
+		args := []string{
+			"add", "sync", syncName,
+			fmt.Sprintf("dbs=%s", dbsArg),
+			fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
+		}
+
 		if sync.Herd != "" {
 			log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
 			if len(sync.Sources) == 0 {
@@ -206,55 +218,36 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			}
 			sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
 
-			runBucardoCommand("del", "herd", sync.Herd)
+			runBucardoCommand("del", "herd", sync.Herd, "--force")
 			runBucardoCommand("add", "herd", sync.Herd)
 			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 
-			args := []string{
-				"add", "sync", syncName,
-				fmt.Sprintf("herd=%s", sync.Herd),
-				fmt.Sprintf("dbs=%s", dbsArg),
-				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
-			}
-			if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
-				// Ensure the sync does not persist after its run
-				args = append(args, "stayalive=0", "kidsalive=0")
-			}
-			if sync.StrictChecking != nil {
-				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
-			}
-			if err := runBucardoCommand(args...); err != nil {
-				log.Fatalf("Failed to add herd-based sync %s: %v", syncName, err)
-			}
-			applySyncCustomizations(sync, syncName)
+			args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
 		} else if sync.Tables != "" {
 			log.Println("[CONTAINER] Using table list")
-			// Make the check case-insensitive
 			trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
 			if trimmedTables == "all" || trimmedTables == "*" {
 				log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName)
 			}
-
-			args := []string{
-				"add", "sync", syncName,
-				fmt.Sprintf("dbs=%s", dbsArg),
-				fmt.Sprintf("tables=%s", sync.Tables),
-				fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
-			}
-			if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
-				// Ensure the sync does not persist after its run
-				args = append(args, "stayalive=0", "kidsalive=0")
-			}
-			if sync.StrictChecking != nil {
-				args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
-			}
-			if err := runBucardoCommand(args...); err != nil {
-				log.Fatalf("Failed to add table-based sync %s: %v", syncName, err)
-			}
-			applySyncCustomizations(sync, syncName)
+			args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
 		} else {
 			log.Printf("[WARNING] Sync %s has no 'herd' or 'tables' defined. Skipping.", syncName)
+			continue
 		}
+
+		// Add optional parameters
+		if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
+			args = append(args, "stayalive=0", "kidsalive=0")
+		}
+		if sync.StrictChecking != nil {
+			args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
+		}
+
+		// Execute the command and apply customizations
+		if err := runBucardoCommand(args...); err != nil {
+			log.Fatalf("Failed to add sync %s: %v", syncName, err)
+		}
+		applySyncCustomizations(sync, syncName)
 	}
 }
 
@@ -312,7 +305,7 @@ func stopBucardo() {
 		// The most reliable way to check if Bucardo has stopped is to see if its
 		// PID file has been removed. `bucardo status` can return a 0 exit code
 		// even when the daemon is not running.
-		if _, err := os.Stat("/var/run/bucardo/bucardo.pid"); os.IsNotExist(err) {
+		if _, err := os.Stat("/var/run/bucardo/bucardo.mcp.pid"); os.IsNotExist(err) {
 			log.Println("[CONTAINER] Bucardo has stopped.")
 			return
 		}
