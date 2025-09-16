@@ -1,21 +1,17 @@
-# Bucardo
+# Bucardo Docker Image
 
 This repository provides a Docker image for [Bucardo](https://bucardo.org/), a powerful asynchronous multi-master replication system for PostgreSQL. The image is based on Ubuntu and is automatically built and published to Docker Hub.
 
 **Docker Hub:** [weverkley/bucardo](https://hub.docker.com/r/weverkley/bucardo)
 
 ## Table of Contents
+
 * [Features](#features)
 * [Usage](#usage)
-  * [Configuration (`bucardo.json`)](#configuration-bucardojson)
-  * Running the Container
-    * Using `docker run`
-    * Using `docker-compose`
-* Customizing the Build
-* Configuration Details
-  * The `databases` object
-  * The `syncs` object
-* Acknowledgements
+  * Quick Start with Docker Compose
+  * Configuration (`bucardo.json`)
+  * Advanced Usage
+* Troubleshooting
 * [Copyright and License](#copyright-and-license)
 
 ---
