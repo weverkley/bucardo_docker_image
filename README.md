@@ -37,9 +37,6 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   ```jsonc
   {
-    "log_level": "VERBOSE",
-    "exit_on_complete": false,
-    "exit_on_complete_timeout": 300,
     "databases":[
       {
         "id": 3,
@@ -68,12 +65,16 @@ First, create a `bucardo.json` configuration file. The container will mount and 
         "sources": [3],
         "targets": [1,2],
         "herd": "all_from_source",
-        "onetimecopy": 1
+        "onetimecopy": 2,
+        "conflict_strategy": "bucardo_source",
+        "exit_on_complete": true,
+        "exit_on_complete_timeout": 300
       },{
         "sources": [1,2],
         "targets": [3],
         "tables": "product, order",
-        "onetimecopy": 0
+        "onetimecopy": 0,
+        "exit_on_complete": false
       }
     ]
   }
@@ -91,7 +92,7 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   * You must define what to sync. You can either use `herd` or `tables`:
     - `herd`: Provide a string with a name for the herd. All tables from the first source database will be added to this herd and synchronized.
-    - `tables`: A string containing a comma-separated list of tables to be synchronized.
+    - `tables`: A string containing a comma-separated list of tables to be synchronized (e.g., `"public.users, public.orders"`).
 
   * [Onetimecopy](https://bucardo.org/wiki/Onetimecopy) is used for full table copy:
     - 0 No full copy is done
@@ -99,21 +100,31 @@ First, create a `bucardo.json` configuration file. The container will mount and 
     - 2 A full copy is done in case the destination table is empty
   
   * `strict_checking` (optional): A boolean (`true` or `false`). If set to `false`, Bucardo will not perform strict schema validation, allowing for differences in column order between source and target tables. Defaults to `true` if not specified.
-
-  * `log_level` (optional): A string to control Bucardo's logging verbosity. Set to `"VERBOSE"` or `"DEBUG"` to get detailed, real-time logs about sync activity. This is highly recommended for monitoring and troubleshooting.
-
+  
+  * `conflict_strategy` (optional): A string that defines how Bucardo should handle conflicts (e.g., when a row is updated on both the source and target). If not specified, Bucardo uses its default (`bucardo_random`). Supported values are:
+    - `bucardo_source`: The source database always wins. This is the recommended setting for "upsert" behavior, as it ensures the target reflects the source.
+    - `bucardo_target`: The target database always wins.
+    - `bucardo_skip`: The conflicting row is not replicated.
+    - `bucardo_latest`: The row with the most recent change wins (requires a timestamp column).
+    - `bucardo_abort`: The entire synchronization is aborted on a conflict.
+    - `bucardo_random`: A random database is chosen to be the winner (the default).
+  
   * `exit_on_complete` (optional): A boolean (`true` or `false`). When set to `true`, the container will perform a single synchronization and then automatically shut down and exit. This is ideal for "run-once" or batch-style replication tasks.
     - **Note:** This feature requires `log_level` to be set to `VERBOSE` or `DEBUG` to detect sync completion.
 
   * `exit_on_complete_timeout` (optional): An integer representing seconds. Use this with `exit_on_complete: true`. If the sync does not complete within this time, the container will exit with an error. This prevents failed syncs from running forever.
 
+  * `log_level` (optional, global): A string to control Bucardo's logging verbosity. Set to `"VERBOSE"` or `"DEBUG"` to get detailed, real-time logs about sync activity. This is highly recommended for monitoring and troubleshooting.
 
-4. Start the container:
+
+### Running the Container
+
+#### Using `docker run`
 
   ```bash
   docker run --name my_own_bucardo_container \
-    -v <bucardo.json dir>:/media/bucardo \
-    -d weverkley/bucardo
+    -v "$(pwd)/bucardo.json:/media/bucardo/bucardo.json" \
+    -d --rm weverkley/bucardo
   ```
 
 5. Check bucardo's status:

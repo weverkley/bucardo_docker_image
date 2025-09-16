@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,11 +21,9 @@ const bucardoConfigPath = "/media/bucardo/bucardo.json"
 
 // BucardoConfig represents the structure of bucardo.json
 type BucardoConfig struct {
-	Databases             []Database `json:"databases"`
-	Syncs                 []Sync     `json:"syncs"`
-	LogLevel              string     `json:"log_level,omitempty"`
-	ExitOnComplete        *bool      `json:"exit_on_complete,omitempty"`
-	ExitOnCompleteTimeout *int       `json:"exit_on_complete_timeout,omitempty"`
+	Databases []Database `json:"databases"`
+	Syncs     []Sync     `json:"syncs"`
+	LogLevel  string     `json:"log_level,omitempty"`
 }
 
 // Database defines a database connection for Bucardo
@@ -39,12 +38,15 @@ type Database struct {
 
 // Sync defines a Bucardo synchronization task
 type Sync struct {
-	Sources        []int  `json:"sources"`
-	Targets        []int  `json:"targets"`
-	Herd           string `json:"herd,omitempty"`
-	Tables         string `json:"tables,omitempty"`
-	Onetimecopy    int    `json:"onetimecopy"`
-	StrictChecking *bool  `json:"strict_checking,omitempty"`
+	Sources               []int  `json:"sources"`
+	Targets               []int  `json:"targets"`
+	Herd                  string `json:"herd,omitempty"`
+	Tables                string `json:"tables,omitempty"`
+	Onetimecopy           int    `json:"onetimecopy"`
+	StrictChecking        *bool  `json:"strict_checking,omitempty"`
+	ExitOnComplete        *bool  `json:"exit_on_complete,omitempty"`
+	ExitOnCompleteTimeout *int   `json:"exit_on_complete_timeout,omitempty"`
+	ConflictStrategy      string `json:"conflict_strategy,omitempty"`
 }
 
 // runCommand executes a shell command and prints its output.
@@ -154,6 +156,31 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 	}
 }
 
+// applySyncCustomizations applies advanced sync settings using 'bucardo update'.
+func applySyncCustomizations(sync Sync, syncName string) {
+	// Set the conflict_strategy if specified.
+	if sync.ConflictStrategy != "" {
+		validStrategies := map[string]bool{
+			"bucardo_source": true,
+			"bucardo_target": true,
+			"bucardo_skip":   true,
+			"bucardo_random": true,
+			"bucardo_latest": true,
+			"bucardo_abort":  true,
+		}
+		if !validStrategies[sync.ConflictStrategy] {
+			log.Printf("[WARNING] Invalid conflict_strategy '%s' for sync '%s'. Skipping.", sync.ConflictStrategy, syncName)
+			return
+		}
+
+		log.Printf("[CONTAINER] Setting conflict_strategy=%s for sync '%s'", sync.ConflictStrategy, syncName)
+		if err := runBucardoCommand("update", "sync", syncName, fmt.Sprintf("conflict_strategy=%s", sync.ConflictStrategy)); err != nil {
+			log.Printf("[WARNING] Failed to set conflict_strategy for sync '%s': %v", syncName, err)
+		}
+
+	}
+}
+
 // addSyncsToBucardo configures the syncs in Bucardo.
 func addSyncsToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding syncs to Bucardo...")
@@ -195,11 +222,13 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			if err := runBucardoCommand(args...); err != nil {
 				log.Fatalf("Failed to add herd-based sync %s: %v", syncName, err)
 			}
+			applySyncCustomizations(sync, syncName)
 		} else if sync.Tables != "" {
 			log.Println("[CONTAINER] Using table list")
-			trimmedTables := strings.TrimSpace(sync.Tables)
+			// Make the check case-insensitive
+			trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
 			if trimmedTables == "all" || trimmedTables == "*" {
-				log.Fatalf("Error in sync '%s': The 'tables' field cannot be '%s'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName, trimmedTables)
+				log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName)
 			}
 
 			args := []string{
@@ -214,6 +243,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			if err := runBucardoCommand(args...); err != nil {
 				log.Fatalf("Failed to add table-based sync %s: %v", syncName, err)
 			}
+			applySyncCustomizations(sync, syncName)
 		} else {
 			log.Printf("[WARNING] Sync %s has no 'herd' or 'tables' defined. Skipping.", syncName)
 		}
@@ -221,28 +251,40 @@ func addSyncsToBucardo(config *BucardoConfig) {
 }
 
 // streamBucardoLog tails the Bucardo log file and streams it to stdout.
-func streamBucardoLog() {
+// It returns the command object so the caller can manage its lifecycle.
+func streamBucardoLog() *exec.Cmd {
 	// Wait a moment for the log file to be created by Bucardo.
 	time.Sleep(2 * time.Second)
 
 	// Use `tail -f` to stream the log file.
 	cmd := exec.Command("tail", "-F", bucardoLogPath)
+	// Create a new process group for tail. This allows us to kill it and its children.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	log.Printf("[CONTAINER] Streaming Bucardo log file: %s", bucardoLogPath)
 	if err := cmd.Start(); err != nil {
 		log.Printf("[WARNING] Could not start streaming Bucardo log file: %v", err)
-		return
+		return nil
 	}
 
-	// We don't call cmd.Wait() here because we want this to run in the background
-	// for the life of the container. The process will be terminated when the container stops.
+	// Return the command so the caller can wait for it or kill it.
+	return cmd
 }
 
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
 	log.Println("[CONTAINER] Starting Bucardo...")
+
+	// Before starting, ensure no stale Bucardo processes are running.
+	// This can happen if the container was stopped uncleanly.
+	// We ignore the error because it will fail if Bucardo is not running, which is the desired state.
+	log.Println("[CONTAINER] Checking for and stopping any stale Bucardo processes...")
+	runBucardoCommand("stop")
+	// Give it a moment to stop
+	time.Sleep(2 * time.Second)
+
 	if err := runBucardoCommand("start"); err != nil {
 		log.Fatalf("Failed to start bucardo: %v", err)
 	}
@@ -259,20 +301,27 @@ func stopBucardo() {
 
 	log.Println("[CONTAINER] Waiting for Bucardo to stop completely...")
 	for {
-		// We check the output of `bucardo status` to see if it has stopped.
-		// A non-zero exit code from `bucardo status` indicates it's not running.
-		cmd := exec.Command("su", "-", "postgres", "-c", "bucardo status")
-		if err := cmd.Run(); err != nil {
+		// The most reliable way to check if Bucardo has stopped is to see if its
+		// PID file has been removed. `bucardo status` can return a 0 exit code
+		// even when the daemon is not running.
+		if _, err := os.Stat("/var/run/bucardo/bucardo.pid"); os.IsNotExist(err) {
 			log.Println("[CONTAINER] Bucardo has stopped.")
 			return
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 }
 
-// monitorBucardo continuously prints the Bucardo status.
+// monitorBucardo handles long-running mode, streaming logs and waiting for a termination signal.
 func monitorBucardo() {
-	go streamBucardoLog()
+	tailCmd := streamBucardoLog()
+	if tailCmd != nil && tailCmd.Process != nil {
+		defer func() {
+			log.Println("[CONTAINER] Stopping log streamer...")
+			// Kill the process group to ensure tail and any children are stopped.
+			syscall.Kill(-tailCmd.Process.Pid, syscall.SIGKILL)
+		}()
+	}
 
 	// Set up a channel to listen for termination signals.
 	sigs := make(chan os.Signal, 1)
@@ -297,15 +346,24 @@ func monitorBucardo() {
 	}
 }
 
-// monitorForCompletionAndExit tails the Bucardo log, waits for a completion message,
-// and then stops Bucardo and exits the container.
-func monitorForCompletionAndExit(config *BucardoConfig) {
-	log.Println("[CONTAINER] 'exit_on_complete' is true. Will exit after first successful sync.")
+// monitorSyncs tails the Bucardo log, waits for completion messages for "run-once" syncs,
+// and stops them individually. If all syncs are "run-once", it exits the container after they finish.
+func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeout *int) {
+	if config.LogLevel != "VERBOSE" && config.LogLevel != "DEBUG" {
+		log.Printf("[WARNING] 'exit_on_complete' is true, but 'log_level' is not 'VERBOSE' or 'DEBUG'.")
+		log.Printf("[WARNING] The completion message may not be logged, and the container might time out or run indefinitely.")
+	}
+
+	if len(runOnceSyncs) > 0 {
+		log.Printf("[CONTAINER] Monitoring %d sync(s) for completion: %v", len(runOnceSyncs), getMapKeys(runOnceSyncs))
+	}
+
+	allSyncsAreRunOnce := len(config.Syncs) == len(runOnceSyncs)
 
 	var timeoutChannel <-chan time.Time
 
 	// Wait a moment for the log file to be created by Bucardo.
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	cmd := exec.Command("tail", "-F", bucardoLogPath)
 
@@ -316,26 +374,33 @@ func monitorForCompletionAndExit(config *BucardoConfig) {
 	}
 	cmd.Stderr = os.Stderr
 
+	// Create a context that we can cancel to stop the tail command
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure cancellation happens on function exit
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("[ERROR] Could not start tail command: %v", err)
 	}
-
 	// Set up the timeout if specified
-	if config.ExitOnCompleteTimeout != nil && *config.ExitOnCompleteTimeout > 0 {
-		timeoutDuration := time.Duration(*config.ExitOnCompleteTimeout) * time.Second
-		log.Printf("[CONTAINER] Setting a timeout of %v for sync completion.", timeoutDuration)
+	if maxTimeout != nil && *maxTimeout > 0 {
+		timeoutDuration := time.Duration(*maxTimeout) * time.Second
+		log.Printf("[CONTAINER] Setting a timeout of %v for run-once sync completion.", timeoutDuration)
 		timeoutChannel = time.After(timeoutDuration)
 	}
 
 	// Channel to receive log lines
 	lineChan := make(chan string)
 	go func() {
+		defer close(lineChan)
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			lineChan <- scanner.Text()
+			select {
+			case lineChan <- scanner.Text():
+			case <-ctx.Done():
+				return
+			}
 		}
-		// If the loop finishes (e.g., tail command exits), close the channel.
-		close(lineChan)
 	}()
 
 	// Read from the pipe line by line
@@ -344,18 +409,49 @@ func monitorForCompletionAndExit(config *BucardoConfig) {
 		case line, ok := <-lineChan:
 			if !ok {
 				log.Println("[CONTAINER] Log streaming finished unexpectedly.")
+				// Kill the tail process group
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				cmd.Wait()
 				return
 			}
 			fmt.Println(line) // Print the log line to the container's stdout
 
-			if strings.Contains(line, "All databases committed") {
-				log.Println("[CONTAINER] Completion message 'All databases committed' detected. Shutting down.")
-				stopBucardo()
-				return // Success
+			// Check for individual sync completion message, e.g., "KID (sync0) Ending sync, status: good"
+			if strings.Contains(line, "Ending sync, status: good") {
+				for syncName := range runOnceSyncs {
+					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) {
+						log.Printf("[CONTAINER] Completion message for sync '%s' detected. Stopping sync.", syncName)
+						if err := runBucardoCommand("stop", syncName); err != nil {
+							log.Printf("[WARNING] Failed to stop sync %s: %v", syncName, err)
+						}
+						// Remove from the map of syncs we are waiting for
+						delete(runOnceSyncs, syncName)
+						log.Printf("[CONTAINER] %d run-once sync(s) remaining.", len(runOnceSyncs))
+					}
+				}
+			}
+
+			// If we were waiting for syncs and now the map is empty, we are done.
+			if len(runOnceSyncs) == 0 {
+				log.Println("[CONTAINER] All monitored syncs have completed.")
+				if allSyncsAreRunOnce {
+					log.Println("[CONTAINER] All configured syncs were run-once. Shutting down container.")
+					cancel()                                        // Stop the scanner goroutine
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group
+					stopBucardo()
+					return // Success
+				} else {
+					// Not all syncs were run-once, so we switch to standard monitoring.
+					log.Println("[CONTAINER] Other syncs are still running. Switching to standard monitoring mode.")
+					cancel()
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					monitorBucardo() // Hand off to the long-running monitor
+					return
+				}
 			}
 		case <-timeoutChannel:
-			log.Println("[ERROR] Timeout reached while waiting for sync completion. Shutting down.")
+			log.Printf("[ERROR] Timeout reached. The following syncs did not complete: %v", getMapKeys(runOnceSyncs))
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group
 			stopBucardo()
 			os.Exit(1) // Exit with a non-zero status code to indicate failure
 		}
@@ -371,6 +467,15 @@ func setLogLevel(config *BucardoConfig) {
 			log.Printf("[WARNING] Failed to set log_level: %v", err)
 		}
 	}
+}
+
+// getMapKeys is a helper to get keys from a map for logging.
+func getMapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func main() {
@@ -391,9 +496,25 @@ func main() {
 	addSyncsToBucardo(config)
 	startBucardo()
 
-	if config.ExitOnComplete != nil && *config.ExitOnComplete {
-		monitorForCompletionAndExit(config)
-		log.Println("[CONTAINER] Process finished.")
+	// Check if any sync has exit_on_complete set to true
+	runOnceSyncs := make(map[string]bool)
+	var maxTimeout *int
+	for i, sync := range config.Syncs {
+		if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
+			syncName := fmt.Sprintf("sync%d", i)
+			runOnceSyncs[syncName] = true
+			if sync.ExitOnCompleteTimeout != nil {
+				if maxTimeout == nil || *sync.ExitOnCompleteTimeout > *maxTimeout {
+					// Use the largest timeout specified across all run-once syncs
+					timeoutVal := *sync.ExitOnCompleteTimeout
+					maxTimeout = &timeoutVal
+				}
+			}
+		}
+	}
+
+	if len(runOnceSyncs) > 0 {
+		monitorSyncs(config, runOnceSyncs, maxTimeout)
 	} else {
 		monitorBucardo()
 	}
