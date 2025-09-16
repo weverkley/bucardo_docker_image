@@ -148,8 +148,8 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			"add", "db", dbName,
 			"--force",
 			fmt.Sprintf("dbname=%s", db.DBName),
-			fmt.Sprintf("user=%s", db.User),
-			fmt.Sprintf("pass=%s", password),
+			fmt.Sprintf("user='%s'", db.User),
+			fmt.Sprintf("pass='%s'", password),
 			fmt.Sprintf("host=%s", db.Host),
 		}
 
