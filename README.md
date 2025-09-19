@@ -63,7 +63,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
         "herd": "all_from_source",
         "onetimecopy": 2,
         "conflict_strategy": "bucardo_source",
-        "exit_on_complete": true,
+        "cron": "0 2 * * *",
+        "exit_on_complete": true, 
         "exit_on_complete_timeout": 300
       },{
         "sources": [1,2],
@@ -110,6 +111,9 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   * `exit_on_complete_timeout` (optional): An integer representing seconds. Use this with `exit_on_complete: true`. If the sync does not complete within this time, the container will exit with an error. This prevents failed syncs from running forever.
 
+  * `cron` (optional): A string containing a standard cron expression (e.g., `"0 2 * * *"` for 2 AM daily). When specified, the sync will be triggered by the container's internal scheduler at the given times, not by Bucardo's default timer.
+    - If `cron` is used with `exit_on_complete: true`, the container will wait for the next scheduled time, run the sync once, and then exit.
+    - If `cron` is used with `exit_on_complete: false` (or omitted), the sync will run repeatedly according to the schedule.
   * `log_level` (optional, global): A string to control Bucardo's logging verbosity. Set to `"VERBOSE"` or `"DEBUG"` to get detailed, real-time logs about sync activity. This is highly recommended for monitoring and troubleshooting.
 
 

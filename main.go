@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 // bucardoLogPath is the default location for the Bucardo log file inside the container.
@@ -49,6 +51,7 @@ type Sync struct {
 	ExitOnComplete        *bool  `json:"exit_on_complete,omitempty"`         // If true, the container will exit after this sync completes.
 	ExitOnCompleteTimeout *int   `json:"exit_on_complete_timeout,omitempty"` // Timeout in seconds for run-once syncs.
 	ConflictStrategy      string `json:"conflict_strategy,omitempty"`        // Defines how to resolve data conflicts (e.g., "bucardo_source").
+	Cron                  string `json:"cron,omitempty"`                     // A cron expression (e.g., "0 2 * * *") for scheduled runs.
 }
 
 // runCommand executes a shell command and prints its output.
@@ -285,6 +288,11 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			// stayalive=0 and kidsalive=0 ensure the sync does not persist after its initial run.
 			args = append(args, "stayalive=0", "kidsalive=0")
 		}
+		if sync.Cron != "" {
+			// autokick=0 prevents Bucardo's internal scheduler from running this sync.
+			// Our external cron scheduler will be responsible for kicking it.
+			args = append(args, "autokick=0")
+		}
 		if sync.StrictChecking != nil {
 			args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
 		}
@@ -516,6 +524,93 @@ func getMapKeys(m map[string]bool) []string {
 	return keys
 }
 
+// CronJob represents a sync that is scheduled to run via a cron expression.
+type CronJob struct {
+	SyncName       string
+	CronExpression string
+	ExitOnComplete bool
+	Timeout        *int
+}
+
+// runCronScheduler sets up and runs a cron scheduler for syncs with a 'cron' property.
+func runCronScheduler(jobs []CronJob) {
+	c := cron.New()
+	var runOnceJob *CronJob // Special handling for the first job with exit_on_complete
+
+	for i := range jobs {
+		job := jobs[i] // Create a local copy for the closure
+
+		// If a job is marked for exit, we only schedule it to run ONCE at its next designated time.
+		if job.ExitOnComplete {
+			if runOnceJob == nil {
+				runOnceJob = &job
+			} else {
+				log.Printf("[WARNING] Multiple cron syncs have 'exit_on_complete: true'. Only the first one ('%s') will cause an exit. The others will run on their schedule but will not trigger an exit.", runOnceJob.SyncName)
+			}
+			continue // Don't add to the recurring scheduler
+		}
+
+		// This is a recurring cron job.
+		_, err := c.AddFunc(job.CronExpression, func() {
+			log.Printf("[CRON] Kicking sync '%s' as per schedule '%s'", job.SyncName, job.CronExpression)
+			// We don't specify a timeout for recurring jobs, letting Bucardo handle it.
+			if err := runBucardoCommand("kick", job.SyncName, "0"); err != nil {
+				log.Printf("[ERROR] Failed to kick sync '%s': %v", job.SyncName, err)
+			}
+		})
+		if err != nil {
+			log.Printf("[ERROR] Failed to schedule cron job for sync '%s': %v. This sync will not run.", job.SyncName, err)
+		}
+	}
+
+	// If there's a run-once job, handle it separately.
+	if runOnceJob != nil {
+		schedule, err := cron.ParseStandard(runOnceJob.CronExpression)
+		if err != nil {
+			log.Fatalf("[ERROR] Invalid cron expression for sync '%s': %v", runOnceJob.SyncName, err)
+		}
+
+		nextRun := schedule.Next(time.Now())
+		log.Printf("[CRON] Sync '%s' is a run-once job. It will run next at %s and then the container will exit upon completion.", runOnceJob.SyncName, nextRun.Format(time.RFC1123))
+
+		// Wait until the next scheduled time.
+		time.Sleep(time.Until(nextRun))
+
+		// Kick the sync.
+		log.Printf("[CRON] Kicking one-time sync '%s'", runOnceJob.SyncName)
+		kickTimeout := "0" // Bucardo's default timeout
+		if runOnceJob.Timeout != nil {
+			kickTimeout = fmt.Sprintf("%d", *runOnceJob.Timeout)
+		}
+		if err := runBucardoCommand("kick", runOnceJob.SyncName, kickTimeout); err != nil {
+			log.Printf("[ERROR] Failed to kick sync '%s': %v. The container will now exit.", runOnceJob.SyncName, err)
+			os.Exit(1)
+		}
+
+		// Now, monitor this single sync for completion.
+		// We create a temporary config and sync map for monitorSyncs.
+		dummyConfig := &BucardoConfig{LogLevel: "VERBOSE"} // Assume VERBOSE for monitoring
+		syncsToWatch := map[string]bool{runOnceJob.SyncName: true}
+		monitorSyncs(dummyConfig, syncsToWatch, runOnceJob.Timeout)
+		log.Println("[CRON] Run-once job complete. Exiting.")
+		return // Exit the application.
+	}
+
+	// If we are here, there were no run-once jobs, so we run the scheduler indefinitely.
+	if len(c.Entries()) > 0 {
+		log.Printf("[CRON] Starting cron scheduler for %d recurring sync(s).", len(c.Entries()))
+		c.Start()
+
+		// Keep the application alive while the cron scheduler runs in the background.
+		// Also stream logs.
+		monitorBucardo()
+		log.Println("[CRON] Shutting down cron scheduler.")
+		<-c.Stop().Done()
+	} else {
+		log.Println("[CONTAINER] No cron jobs were scheduled. The container will now exit as there is nothing to do.")
+	}
+}
+
 func main() {
 	// Use a more granular timestamp for logs.
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -541,9 +636,12 @@ func main() {
 	addSyncsToBucardo(config)
 	startBucardo()
 
-	// Determine if we should enter run-once mode or long-running mode.
+	// --- Determine execution mode: Cron, Run-Once, or Standard Long-Running ---
+
 	runOnceSyncs := make(map[string]bool)
+	cronJobs := []CronJob{}
 	var maxTimeout *int
+
 	for i, sync := range config.Syncs {
 		if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
 			syncName := fmt.Sprintf("sync%d", i)
@@ -556,13 +654,26 @@ func main() {
 				}
 			}
 		}
+
+		if sync.Cron != "" {
+			syncName := fmt.Sprintf("sync%d", i)
+			cronJobs = append(cronJobs, CronJob{
+				SyncName:       syncName,
+				CronExpression: sync.Cron,
+				ExitOnComplete: sync.ExitOnComplete != nil && *sync.ExitOnComplete,
+				Timeout:        sync.ExitOnCompleteTimeout,
+			})
+		}
 	}
 
-	// If there are any run-once syncs, enter the specific monitoring mode for them.
-	if len(runOnceSyncs) > 0 {
+	// Priority 1: If there are cron jobs, the cron scheduler takes over.
+	if len(cronJobs) > 0 {
+		runCronScheduler(cronJobs)
+		// Priority 2: If there are non-cron run-once syncs, monitor them for completion.
+	} else if len(runOnceSyncs) > 0 {
 		monitorSyncs(config, runOnceSyncs, maxTimeout)
+		// Priority 3: Otherwise, enter the standard long-running mode.
 	} else {
-		// Otherwise, enter the standard long-running mode.
 		monitorBucardo()
 	}
 }
