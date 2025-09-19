@@ -42,8 +42,9 @@ type Database struct {
 
 // Sync defines a Bucardo synchronization task, detailing what to replicate from where to where.
 type Sync struct {
-	Sources               []int  `json:"sources"`                            // A list of database IDs to use as sources.
-	Targets               []int  `json:"targets"`                            // A list of database IDs to use as targets.
+	Sources               []int  `json:"sources,omitempty"`                  // A list of database IDs to use as sources.
+	Targets               []int  `json:"targets,omitempty"`                  // A list of database IDs to use as targets.
+	Bidirectional         []int  `json:"bidirectional,omitempty"`            // A list of database IDs for bidirectional (dbgroup) replication.
 	Herd                  string `json:"herd,omitempty"`                     // The name of a herd (group) to sync all tables from the first source.
 	Tables                string `json:"tables,omitempty"`                   // A comma-separated list of specific tables to sync.
 	Onetimecopy           int    `json:"onetimecopy"`                        // Controls full-copy behavior (0=off, 1=always, 2=if target empty).
@@ -240,47 +241,72 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		runBucardoCommand("del", "sync", syncName, "--force")
 
-		// Prepare the database connection string for the sync command.
-		var dbStrings []string
-		for _, sourceID := range sync.Sources {
-			dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
-		}
-		for _, targetID := range sync.Targets {
-			dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
-		}
-		dbsArg := strings.Join(dbStrings, ",")
-
 		// Prepare the base arguments for the `bucardo add sync` command.
 		args := []string{
 			"add", "sync", syncName,
-			fmt.Sprintf("dbs=%s", dbsArg),
 			fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
 		}
 
-		if sync.Herd != "" {
-			log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
-			if len(sync.Sources) == 0 {
-				log.Fatalf("Sync %s uses a herd but has no sources defined.", syncName)
-			}
-			sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
+		// --- Handle different sync types: bidirectional takes precedence ---
 
-			// For a herd, we must create the herd and add all tables from the source before creating the sync.
-			runBucardoCommand("del", "herd", sync.Herd, "--force")
-			runBucardoCommand("add", "herd", sync.Herd)
-			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
-
-			args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
-		} else if sync.Tables != "" {
-			log.Println("[CONTAINER] Using table list")
-			// Prevent users from accidentally trying to sync all tables via the 'tables' field.
-			trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
-			if trimmedTables == "all" || trimmedTables == "*" {
-				log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName)
+		if len(sync.Bidirectional) > 0 {
+			// Handle bidirectional (multi-master) sync using a dbgroup.
+			log.Printf("[CONTAINER] Configuring bidirectional sync for dbs: %v", sync.Bidirectional)
+			if len(sync.Bidirectional) < 2 {
+				log.Fatalf("Error in sync '%s': 'bidirectional' syncs require at least two database IDs.", syncName)
 			}
-			args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
-		} else {
-			log.Printf("[WARNING] Sync %s has no 'herd' or 'tables' defined. Skipping.", syncName)
-			continue
+
+			// Create a dbgroup for the bidirectional sync.
+			dbgroupName := fmt.Sprintf("bg_%s", syncName)
+			runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
+
+			var dbgroupArgs []string
+			for _, dbID := range sync.Bidirectional {
+				// For multi-master, all databases in the group are sources.
+				dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", dbID))
+			}
+			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupArgs...)...)
+
+			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
+			if sync.Tables != "" {
+				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
+			}
+
+		} else if len(sync.Sources) > 0 && len(sync.Targets) > 0 {
+			// Handle standard source -> target sync
+			var dbStrings []string
+			for _, sourceID := range sync.Sources {
+				dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
+			}
+			for _, targetID := range sync.Targets {
+				dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
+			}
+			dbsArg := strings.Join(dbStrings, ",")
+			args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
+
+			// For standard syncs, we need either a herd or a list of tables.
+			if sync.Herd != "" {
+				log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
+				sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
+
+				// For a herd, we must create the herd and add all tables from the source before creating the sync.
+				runBucardoCommand("del", "herd", sync.Herd, "--force")
+				runBucardoCommand("add", "herd", sync.Herd)
+				runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
+
+				args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
+			} else if sync.Tables != "" {
+				log.Println("[CONTAINER] Using table list")
+				// Prevent users from accidentally trying to sync all tables via the 'tables' field.
+				trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
+				if trimmedTables == "all" || trimmedTables == "*" {
+					log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName)
+				}
+				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
+			} else {
+				log.Printf("[WARNING] Sync %s has no 'herd' or 'tables' defined. Skipping.", syncName)
+				continue
+			}
 		}
 
 		// Add optional parameters to the `add sync` command.
