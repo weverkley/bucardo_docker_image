@@ -79,14 +79,11 @@ func runCommand(logCmd, name string, arg ...string) error {
 
 // runBucardoCommand is a helper to execute a `bucardo` command as the 'postgres' user.
 func runBucardoCommand(args ...string) error {
-	// Prepend "bucardo" to the arguments to form the full command.
-	fullBucardoCmd := append([]string{"bucardo"}, args...)
-
-	// Construct the command string for logging purposes only.
-	logCmdStr := strings.Join(fullBucardoCmd, " ")
+	// Construct the command that will be executed inside the `su -c` shell.
+	bucardoCmdWithArgs := bucardoCmd + " " + strings.Join(args, " ")
 
 	// Execute `su - postgres -c "bucardo arg1 arg2 ..."` but pass arguments safely.
-	return runCommand(logCmdStr, "su", "-", bucardoUser, "-c", strings.Join(fullBucardoCmd, " "))
+	return runCommand(bucardoCmdWithArgs, "su", "-", bucardoUser, "-c", bucardoCmdWithArgs)
 }
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
@@ -504,38 +501,37 @@ func streamBucardoLog() *exec.Cmd {
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
 	log.Println("[CONTAINER] Starting Bucardo...")
-
-	// Before starting, attempt to stop any stale Bucardo processes that might have been
-	// left over from an unclean shutdown. We ignore errors here.
+	// Before starting, ensure any stale Bucardo processes from an unclean shutdown are stopped.
 	log.Println("[CONTAINER] Checking for and stopping any stale Bucardo processes...")
-	runBucardoCommand("stop")
-	// Give it a moment to stop
-	time.Sleep(2 * time.Second)
+	stopBucardo() // Use our robust stop function.
 
 	if err := runBucardoCommand("start"); err != nil {
 		log.Fatalf("Failed to start bucardo: %v", err)
 	}
 }
 
-// stopBucardo stops the Bucardo service and waits for it to shut down.
+// stopBucardo gracefully stops the Bucardo service and waits for confirmation.
 func stopBucardo() {
 	log.Println("[CONTAINER] Stopping Bucardo...")
 	if err := runBucardoCommand("stop"); err != nil {
-		// Log as a warning because we are shutting down anyway.
 		log.Printf("[WARNING] 'bucardo stop' command failed: %v", err)
 	}
 
 	log.Println("[CONTAINER] Waiting for Bucardo to stop completely...")
-	// Loop until the main Bucardo PID file is removed, which confirms a clean shutdown.
-	for {
-		// Checking for the absence of the MCP (Master Control Process) PID file is the
-		// most reliable way to confirm Bucardo has stopped.
+	const shutdownTimeout = 30 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	for ctx.Err() == nil {
+		// The absence of the MCP PID file is the most reliable way to confirm a clean stop.
 		if _, err := os.Stat("/var/run/bucardo/bucardo.mcp.pid"); os.IsNotExist(err) {
 			log.Println("[CONTAINER] Bucardo has stopped.")
 			return
 		}
 		time.Sleep(1 * time.Second)
 	}
+
+	log.Printf("[ERROR] Bucardo did not stop gracefully within %v. The process may be hung.", shutdownTimeout)
 }
 
 // monitorBucardo handles the default long-running mode. It streams logs and waits for a
