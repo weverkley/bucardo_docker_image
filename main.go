@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -318,6 +319,31 @@ func syncExists(syncName string) bool {
 	return strings.Contains(string(output), searchString)
 }
 
+// getSyncDbgroup finds the name of the dbgroup currently associated with a sync by parsing command output.
+func getSyncDbgroup(syncName string) (string, error) {
+	// This regex finds the "DB group" label and captures the quoted group name that follows.
+	// e.g., from '... DB group "my_group_name" ...' it captures 'my_group_name'.
+	re := regexp.MustCompile(`DB group "([^"]+)"`)
+
+	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list sync %s", syncName))
+	// Use CombinedOutput to capture both stdout and stderr for better debugging.
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to execute 'bucardo list sync %s': %w. Output: %s", syncName, err, outputStr)
+	}
+
+	matches := re.FindStringSubmatch(outputStr)
+	if len(matches) > 1 {
+		return matches[1], nil // The first capture group is the dbgroup name.
+	}
+
+	// If we are here, parsing failed. Log the output for debugging.
+	log.Printf("[DEBUG] Bucardo output for 'list sync %s':\n---\n%s\n---", syncName, outputStr)
+	return "", fmt.Errorf("could not find 'DB group \"<name>\"' pattern in output for sync '%s'", syncName)
+}
+
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding syncs to Bucardo...")
@@ -378,6 +404,12 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
 			} else { // command == "update"
 				// The "swap and replace" method for updating a dbgroup without data loss.
+				// 0. Find the name of the dbgroup currently used by the sync.
+				oldDbgroupName, err := getSyncDbgroup(sync.Name)
+				if err != nil {
+					log.Fatalf("Failed to determine current dbgroup for sync '%s': %v", sync.Name, err)
+				}
+
 				// 1. Create a new, temporary dbgroup with the correct members.
 				tempDbgroupName := fmt.Sprintf("sg_%s_%d", sync.Name, time.Now().Unix())
 				log.Printf("[CONTAINER] Creating temporary dbgroup '%s' for sync update.", tempDbgroupName)
@@ -392,6 +424,17 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 				// 2. Atomically update the sync to use the new dbgroup.
 				args = append(args, fmt.Sprintf("dbs=%s", tempDbgroupName))
+
+				// Defer the cleanup of the old dbgroup until after the sync update command succeeds.
+				defer func(groupToDelete string) {
+					// This check is important. If the old group was the same as the new one (unlikely but possible), don't delete it.
+					if groupToDelete != tempDbgroupName {
+						log.Printf("[CONTAINER] Cleaning up old dbgroup '%s'.", groupToDelete)
+						if err := runBucardoCommand("del", "dbgroup", groupToDelete, "--force"); err != nil {
+							log.Printf("[WARNING] Failed to clean up old dbgroup '%s': %v", groupToDelete, err)
+						}
+					}
+				}(oldDbgroupName)
 			}
 
 			// For standard syncs, we need either a herd or a list of tables.
@@ -431,13 +474,6 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		// Execute the command and apply customizations
 		if err := runBucardoCommand(args...); err != nil {
 			log.Fatalf("Failed to %s sync %s: %v", command, sync.Name, err)
-		}
-
-		// If we just successfully updated a standard sync, we can now safely clean up the old dbgroup.
-		if command == "update" && len(sync.Sources) > 0 {
-			// This is now safe because the sync has been updated to point to the new temporary dbgroup.
-			log.Printf("[CONTAINER] Cleaning up old dbgroup '%s'.", sync.Name)
-			runBucardoCommand("del", "dbgroup", sync.Name, "--force")
 		}
 	}
 }
