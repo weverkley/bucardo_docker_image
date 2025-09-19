@@ -60,6 +60,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
       }],
     "syncs" : [
       {
+        "name": "daily_report_sync",
+
         "sources": [3],
         "targets": [1,2],
         "herd": "all_from_source",
@@ -69,6 +71,8 @@ First, create a `bucardo.json` configuration file. The container will mount and 
         "exit_on_complete": true, 
         "exit_on_complete_timeout": 300
       },{
+        "name": "orders_sync",
+
         "sources": [1,2],
         "targets": [3],
         "tables": "product,orders",
@@ -85,12 +89,15 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   * Once your databases are described, you must describe your *syncs*;
 
-  * You can define a sync as either standard (source-to-target) or bidirectional (multi-master).
+  * Each sync **must** have a unique `name` property. This name is used to identify and manage the sync. On startup, the container will update any sync with a matching name, ensuring your `bucardo.json` file acts as the source of truth for the syncs it defines, without affecting other syncs you may have configured manually.
+
+  * You can define a sync type as either standard (source-to-target) or bidirectional (multi-master).
     - **Standard Syncs**: Use the `sources` and `targets` properties with arrays of database IDs.
     - **Bidirectional Syncs**: Use the `bidirectional` property with an array of two or more database IDs. This creates a multi-master replication group where all databases sync with each other. When `bidirectional` is used, the `sources` and `targets` properties are ignored. The `tables` property is required, and using a `conflict_strategy` like `bucardo_latest` is highly recommended.
 
       ```jsonc
       {
+        "name": "user_product_bidirectional",
         "bidirectional": [1, 2],
         "tables": "public.users, public.products",
         "onetimecopy": 2,

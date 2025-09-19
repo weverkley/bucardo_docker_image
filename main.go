@@ -49,6 +49,7 @@ type Database struct {
 
 // Sync defines a Bucardo synchronization task, detailing what to replicate from where to where.
 type Sync struct {
+	Name                  string `json:"name"`                               // The unique name for this sync.
 	Sources               []int  `json:"sources,omitempty"`                  // A list of database IDs to use as sources.
 	Targets               []int  `json:"targets,omitempty"`                  // A list of database IDs to use as targets.
 	Bidirectional         []int  `json:"bidirectional,omitempty"`            // A list of database IDs for bidirectional (dbgroup) replication.
@@ -138,6 +139,8 @@ func loadConfig() (*BucardoConfig, error) {
 func validateConfig(config *BucardoConfig) []error {
 	var errors []error
 	dbIDs := make(map[int]bool)
+	syncNames := make(map[string]bool)
+
 	for _, db := range config.Databases {
 		if dbIDs[db.ID] {
 			errors = append(errors, fmt.Errorf("database ID %d is duplicated", db.ID))
@@ -145,26 +148,34 @@ func validateConfig(config *BucardoConfig) []error {
 		dbIDs[db.ID] = true
 	}
 
-	for i, sync := range config.Syncs {
-		syncName := fmt.Sprintf("sync%d", i)
+	for _, sync := range config.Syncs {
+		if sync.Name == "" {
+			errors = append(errors, fmt.Errorf("a sync is missing the required 'name' property"))
+			continue // Can't validate this sync further
+		}
+		if syncNames[sync.Name] {
+			errors = append(errors, fmt.Errorf("sync name '%s' is duplicated", sync.Name))
+		}
+		syncNames[sync.Name] = true
+
 		if len(sync.Bidirectional) > 0 {
 			if len(sync.Bidirectional) < 2 {
-				errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' requires at least two database IDs", syncName))
+				errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' requires at least two database IDs", sync.Name))
 			}
 			for _, id := range sync.Bidirectional {
 				if !dbIDs[id] {
-					errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' database ID %d is not defined in the 'databases' list", syncName, id))
+					errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' database ID %d is not defined in the 'databases' list", sync.Name, id))
 				}
 			}
 		} else { // Standard source/target sync
 			if len(sync.Sources) == 0 {
-				errors = append(errors, fmt.Errorf("sync '%s': must have at least one source", syncName))
+				errors = append(errors, fmt.Errorf("sync '%s': must have at least one source", sync.Name))
 			}
 			if len(sync.Targets) == 0 {
-				errors = append(errors, fmt.Errorf("sync '%s': must have at least one target", syncName))
+				errors = append(errors, fmt.Errorf("sync '%s': must have at least one target", sync.Name))
 			}
 			if sync.Herd == "" && sync.Tables == "" {
-				errors = append(errors, fmt.Errorf("sync '%s': must define either 'herd' or 'tables'", syncName))
+				errors = append(errors, fmt.Errorf("sync '%s': must define either 'herd' or 'tables'", sync.Name))
 			}
 		}
 
@@ -182,7 +193,7 @@ func validateConfig(config *BucardoConfig) []error {
 				for k := range validStrategies {
 					validKeys = append(validKeys, k)
 				}
-				errors = append(errors, fmt.Errorf("sync '%s': invalid conflict_strategy '%s'. Must be one of: %v", syncName, sync.ConflictStrategy, validKeys))
+				errors = append(errors, fmt.Errorf("sync '%s': invalid conflict_strategy '%s'. Must be one of: %v", sync.Name, sync.ConflictStrategy, validKeys))
 			}
 		}
 	}
@@ -230,24 +241,44 @@ func setupPgpassFile(db Database, password string) error {
 	return runCommand("", "chown", fmt.Sprintf("%s:%s", bucardoUser, bucardoUser), pgpassPath)
 }
 
+// databaseExists checks if a Bucardo database with the given name already exists.
+func databaseExists(dbName string) bool {
+	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list dbs")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("[WARNING] Could not list Bucardo databases to check for existence: %v", err)
+		return false
+	}
+
+	// The output format is "Database: <name> ...". We check for this specific pattern.
+	searchString := fmt.Sprintf("Database: %s", dbName)
+	return strings.Contains(string(output), searchString)
+}
+
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
-	log.Println("[CONTAINER] Adding databases to Bucardo...")
+	log.Println("[CONTAINER] Adding/updating databases in Bucardo...")
 	// Clear any existing .pgpass file to start fresh.
 	os.Remove(pgpassPath)
 
 	for _, db := range config.Databases {
-		log.Printf("[CONTAINER] Adding db %s (id: %d)", db.DBName, db.ID)
-
 		dbName := fmt.Sprintf("db%d", db.ID)
-		runBucardoCommand("del", "db", dbName, "--force")
+		exists := databaseExists(dbName)
+		command := "add"
+
+		if exists {
+			command = "update"
+			log.Printf("[CONTAINER] Updating existing db '%s' (id: %d, host: %s)", dbName, db.ID, db.Host)
+		} else {
+			log.Printf("[CONTAINER] Adding new db '%s' (id: %d, host: %s)", dbName, db.ID, db.Host)
+		}
 
 		password, err := getDbPassword(db)
 		if err != nil {
 			log.Fatalf("Error getting password for db id %d: %v", db.ID, err)
 		}
 
-		// Add the password to the .pgpass file to avoid command-line parsing issues.
+		// Re-create the .pgpass file with the current configuration.
 		if err := setupPgpassFile(db, password); err != nil {
 			log.Fatalf("Failed to set up .pgpass for db %s: %v", dbName, err)
 		}
@@ -255,7 +286,7 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 		// Build the arguments for bucardo, omitting the password.
 		// Bucardo will automatically use the .pgpass file.
 		args := []string{
-			"add", "db", dbName, "--force",
+			command, "db", dbName,
 			fmt.Sprintf("dbname=%s", db.DBName),
 			fmt.Sprintf("host=%s", db.Host),
 			fmt.Sprintf("user=%s", db.User),
@@ -264,23 +295,45 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			args = append(args, fmt.Sprintf("port=%d", *db.Port))
 		}
 		if err := runBucardoCommand(args...); err != nil {
-			log.Fatalf("Failed to add database %s: %v", dbName, err)
+			log.Fatalf("Failed to %s database %s: %v", command, dbName, err)
 		}
 	}
+}
+
+// syncExists checks if a Bucardo sync with the given name already exists.
+func syncExists(syncName string) bool {
+	// The `bucardo list sync <name>` command has an unreliable exit code (always 0).
+	// A more reliable method is to list all syncs and check if the name is present.
+	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list syncs")
+	output, err := cmd.Output()
+	if err != nil {
+		// If the command itself fails, we can't determine existence. Log and assume it doesn't exist.
+		log.Printf("[WARNING] Could not list Bucardo syncs to check for existence: %v", err)
+		return false
+	}
+
+	// The output format is "Sync "<name>" ...". We check for this specific pattern.
+	// Using quotes ensures we don't accidentally match a substring in another sync's name.
+	searchString := fmt.Sprintf("Sync \"%s\"", syncName)
+	return strings.Contains(string(output), searchString)
 }
 
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding syncs to Bucardo...")
-	for i, sync := range config.Syncs {
-		syncName := fmt.Sprintf("sync%d", i)
-		log.Printf("[CONTAINER] Adding %s to Bucardo...", syncName)
-
-		runBucardoCommand("del", "sync", syncName, "--force")
+	for _, sync := range config.Syncs {
+		exists := syncExists(sync.Name)
+		command := "add"
+		if exists {
+			command = "update"
+			log.Printf("[CONTAINER] Updating existing sync '%s' in Bucardo...", sync.Name)
+		} else {
+			log.Printf("[CONTAINER] Adding new sync '%s' to Bucardo...", sync.Name)
+		}
 
 		// Prepare the base arguments for the `bucardo add sync` command.
 		args := []string{
-			"add", "sync", syncName,
+			command, "sync", sync.Name,
 			fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
 		}
 
@@ -291,15 +344,17 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			log.Printf("[CONTAINER] Configuring bidirectional sync for dbs: %v", sync.Bidirectional)
 
 			// Create a dbgroup for the bidirectional sync.
-			dbgroupName := fmt.Sprintf("bg_%s", syncName)
-			runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
-
-			var dbgroupArgs []string
-			for _, dbID := range sync.Bidirectional {
-				// For multi-master, all databases in the group are sources.
-				dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", dbID))
+			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
+			// Only create/update the dbgroup if we are adding the sync or if it's a full update.
+			if !exists { // For simplicity, we recreate the dbgroup when adding.
+				runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
+				var dbgroupArgs []string
+				for _, dbID := range sync.Bidirectional {
+					// For multi-master, all databases in the group are sources.
+					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", dbID))
+				}
+				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupArgs...)...)
 			}
-			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupArgs...)...)
 
 			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 			if sync.Tables != "" {
@@ -323,10 +378,12 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
 				sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
 
-				// For a herd, we must create the herd and add all tables from the source before creating the sync.
-				runBucardoCommand("del", "herd", sync.Herd, "--force")
-				runBucardoCommand("add", "herd", sync.Herd)
-				runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
+				// Only create the herd if we are adding the sync. Updating a herd is complex.
+				if !exists {
+					runBucardoCommand("del", "herd", sync.Herd, "--force")
+					runBucardoCommand("add", "herd", sync.Herd)
+					runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
+				}
 
 				args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
 			} else if sync.Tables != "" {
@@ -334,11 +391,11 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				// Prevent users from accidentally trying to sync all tables via the 'tables' field.
 				trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
 				if trimmedTables == "all" || trimmedTables == "*" {
-					log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", syncName)
+					log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", sync.Name)
 				}
 				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
 			} else {
-				log.Printf("[WARNING] Sync %s has no 'herd' or 'tables' defined. Skipping.", syncName)
+				log.Printf("[WARNING] Sync '%s' has no 'herd' or 'tables' defined. Skipping.", sync.Name)
 				continue
 			}
 		}
@@ -362,9 +419,8 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		// Execute the command and apply customizations
 		if err := runBucardoCommand(args...); err != nil {
-			log.Fatalf("Failed to add sync %s: %v", syncName, err)
+			log.Fatalf("Failed to %s sync %s: %v", command, sync.Name, err)
 		}
-		// applySyncCustomizations(sync, syncName) // No longer needed
 	}
 }
 
@@ -723,10 +779,9 @@ func main() {
 	cronJobs := []CronJob{}
 	var maxTimeout *int
 
-	for i, sync := range config.Syncs {
+	for _, sync := range config.Syncs {
 		if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
-			syncName := fmt.Sprintf("sync%d", i)
-			runOnceSyncs[syncName] = true
+			runOnceSyncs[sync.Name] = true
 			if sync.ExitOnCompleteTimeout != nil {
 				if maxTimeout == nil || *sync.ExitOnCompleteTimeout > *maxTimeout {
 					// Use the largest timeout specified across all run-once syncs.
@@ -737,9 +792,8 @@ func main() {
 		}
 
 		if sync.Cron != "" {
-			syncName := fmt.Sprintf("sync%d", i)
 			cronJobs = append(cronJobs, CronJob{
-				SyncName:       syncName,
+				SyncName:       sync.Name,
 				CronExpression: sync.Cron,
 				ExitOnComplete: sync.ExitOnComplete != nil && *sync.ExitOnComplete,
 				Timeout:        sync.ExitOnCompleteTimeout,
