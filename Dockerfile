@@ -1,6 +1,8 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
 COPY main.go .
+COPY go.mod .
+COPY go.sum .
 RUN go build -o /entrypoint main.go
 
 FROM ubuntu:22.04
