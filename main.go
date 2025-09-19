@@ -17,11 +17,18 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-// bucardoLogPath is the default location for the Bucardo log file inside the container.
-const bucardoLogPath = "/var/log/bucardo/log.bucardo"
-
-// bucardoConfigPath is the expected location of the user-provided configuration file.
-const bucardoConfigPath = "/media/bucardo/bucardo.json"
+const (
+	// bucardoLogPath is the default location for the Bucardo log file inside the container.
+	bucardoLogPath = "/var/log/bucardo/log.bucardo"
+	// bucardoConfigPath is the expected location of the user-provided configuration file.
+	bucardoConfigPath = "/media/bucardo/bucardo.json"
+	// pgpassPath is the location of the .pgpass file for the postgres user.
+	pgpassPath = "/var/lib/postgresql/.pgpass"
+	// bucardoUser is the system user that runs Bucardo commands.
+	bucardoUser = "postgres"
+	// bucardoCmd is the name of the Bucardo executable.
+	bucardoCmd = "bucardo"
+)
 
 // BucardoConfig represents the top-level structure of the bucardo.json file.
 type BucardoConfig struct {
@@ -77,7 +84,7 @@ func runBucardoCommand(args ...string) error {
 	logCmdStr := strings.Join(fullBucardoCmd, " ")
 
 	// Execute `su - postgres -c "bucardo arg1 arg2 ..."` but pass arguments safely.
-	return runCommand(logCmdStr, "su", "-", "postgres", "-c", strings.Join(fullBucardoCmd, " "))
+	return runCommand(logCmdStr, "su", "-", bucardoUser, "-c", strings.Join(fullBucardoCmd, " "))
 }
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
@@ -95,7 +102,7 @@ func startPostgres() {
 
 	for ctx.Err() == nil {
 		// We check the output of `bucardo status` to see if it's ready.
-		cmd := exec.Command("su", "-", "postgres", "-c", "bucardo status")
+		cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo status")
 		if err := cmd.Run(); err == nil {
 			log.Println("[CONTAINER] Bucardo is ready.")
 			return
@@ -126,6 +133,63 @@ func loadConfig() (*BucardoConfig, error) {
 	return &config, nil
 }
 
+// validateConfig performs a pre-check of the entire configuration to catch common errors
+// before any commands are run. It returns a list of all validation errors found.
+func validateConfig(config *BucardoConfig) []error {
+	var errors []error
+	dbIDs := make(map[int]bool)
+	for _, db := range config.Databases {
+		if dbIDs[db.ID] {
+			errors = append(errors, fmt.Errorf("database ID %d is duplicated", db.ID))
+		}
+		dbIDs[db.ID] = true
+	}
+
+	for i, sync := range config.Syncs {
+		syncName := fmt.Sprintf("sync%d", i)
+		if len(sync.Bidirectional) > 0 {
+			if len(sync.Bidirectional) < 2 {
+				errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' requires at least two database IDs", syncName))
+			}
+			for _, id := range sync.Bidirectional {
+				if !dbIDs[id] {
+					errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' database ID %d is not defined in the 'databases' list", syncName, id))
+				}
+			}
+		} else { // Standard source/target sync
+			if len(sync.Sources) == 0 {
+				errors = append(errors, fmt.Errorf("sync '%s': must have at least one source", syncName))
+			}
+			if len(sync.Targets) == 0 {
+				errors = append(errors, fmt.Errorf("sync '%s': must have at least one target", syncName))
+			}
+			if sync.Herd == "" && sync.Tables == "" {
+				errors = append(errors, fmt.Errorf("sync '%s': must define either 'herd' or 'tables'", syncName))
+			}
+		}
+
+		if sync.ConflictStrategy != "" {
+			validStrategies := map[string]bool{
+				"bucardo_source": true,
+				"bucardo_target": true,
+				"bucardo_skip":   true,
+				"bucardo_random": true,
+				"bucardo_latest": true,
+				"bucardo_abort":  true,
+			}
+			if !validStrategies[sync.ConflictStrategy] {
+				validKeys := make([]string, 0, len(validStrategies))
+				for k := range validStrategies {
+					validKeys = append(validKeys, k)
+				}
+				errors = append(errors, fmt.Errorf("sync '%s': invalid conflict_strategy '%s'. Must be one of: %v", syncName, sync.ConflictStrategy, validKeys))
+			}
+		}
+	}
+
+	return errors
+}
+
 // getDbPassword resolves the database password, fetching from an environment variable if `pass` is set to "env".
 func getDbPassword(db Database) (string, error) {
 	if db.Pass == "env" {
@@ -152,7 +216,6 @@ func setupPgpassFile(db Database, password string) error {
 
 	// The .pgpass file must be owned by the user running the command (postgres)
 	// and have permissions 0600. We write it to the postgres user's home directory.
-	pgpassPath := "/var/lib/postgresql/.pgpass"
 	f, err := os.OpenFile(pgpassPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open .pgpass file: %w", err)
@@ -164,14 +227,14 @@ func setupPgpassFile(db Database, password string) error {
 	}
 
 	// Ensure the file is owned by the postgres user.
-	return runCommand("", "chown", "postgres:postgres", pgpassPath)
+	return runCommand("", "chown", fmt.Sprintf("%s:%s", bucardoUser, bucardoUser), pgpassPath)
 }
 
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding databases to Bucardo...")
 	// Clear any existing .pgpass file to start fresh.
-	os.Remove("/var/lib/postgresql/.pgpass")
+	os.Remove(pgpassPath)
 
 	for _, db := range config.Databases {
 		log.Printf("[CONTAINER] Adding db %s (id: %d)", db.DBName, db.ID)
@@ -206,32 +269,6 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 	}
 }
 
-// applySyncCustomizations applies advanced sync settings that are not available during
-// the `bucardo add sync` command in this version of Bucardo. It uses `bucardo update sync`.
-func applySyncCustomizations(sync Sync, syncName string) {
-	// Set the conflict_strategy if specified in the config.
-	if sync.ConflictStrategy != "" {
-		validStrategies := map[string]bool{
-			"bucardo_source": true,
-			"bucardo_target": true,
-			"bucardo_skip":   true,
-			"bucardo_random": true,
-			"bucardo_latest": true,
-			"bucardo_abort":  true,
-		}
-		if !validStrategies[sync.ConflictStrategy] {
-			log.Printf("[WARNING] Invalid conflict_strategy '%s' for sync '%s'. Skipping.", sync.ConflictStrategy, syncName)
-			return
-		}
-
-		log.Printf("[CONTAINER] Setting conflict_strategy=%s for sync '%s'", sync.ConflictStrategy, syncName)
-		if err := runBucardoCommand("update", "sync", syncName, fmt.Sprintf("conflict_strategy=%s", sync.ConflictStrategy)); err != nil {
-			log.Printf("[WARNING] Failed to set conflict_strategy for sync '%s': %v", syncName, err)
-		}
-
-	}
-}
-
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding syncs to Bucardo...")
@@ -252,9 +289,6 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		if len(sync.Bidirectional) > 0 {
 			// Handle bidirectional (multi-master) sync using a dbgroup.
 			log.Printf("[CONTAINER] Configuring bidirectional sync for dbs: %v", sync.Bidirectional)
-			if len(sync.Bidirectional) < 2 {
-				log.Fatalf("Error in sync '%s': 'bidirectional' syncs require at least two database IDs.", syncName)
-			}
 
 			// Create a dbgroup for the bidirectional sync.
 			dbgroupName := fmt.Sprintf("bg_%s", syncName)
@@ -322,12 +356,15 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		if sync.StrictChecking != nil {
 			args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
 		}
+		if sync.ConflictStrategy != "" {
+			args = append(args, fmt.Sprintf("conflict_strategy=%s", sync.ConflictStrategy))
+		}
 
 		// Execute the command and apply customizations
 		if err := runBucardoCommand(args...); err != nil {
 			log.Fatalf("Failed to add sync %s: %v", syncName, err)
 		}
-		applySyncCustomizations(sync, syncName)
+		// applySyncCustomizations(sync, syncName) // No longer needed
 	}
 }
 
@@ -660,10 +697,18 @@ func main() {
 		log.Fatalf("[ERROR] Failed to load configuration: %v", err)
 	}
 
+	// Validate the configuration before proceeding.
+	if validationErrors := validateConfig(config); len(validationErrors) > 0 {
+		log.Println("[ERROR] Invalid configuration found in bucardo.json:")
+		for _, e := range validationErrors {
+			log.Printf("- %v", e)
+		}
+		log.Fatal("Please fix the configuration errors and restart the container.")
+	}
+
 	// Main startup sequence.
 	startPostgres()
 	setLogLevel(config)
-
 	// The .pgpass file needs to exist with the right permissions before Bucardo uses it.
 	// We touch it here and set permissions, even if it's empty initially.
 	runCommand("", "touch", "/var/lib/postgresql/.pgpass")
