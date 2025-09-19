@@ -331,9 +331,9 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			log.Printf("[CONTAINER] Adding new sync '%s' to Bucardo...", sync.Name)
 		}
 
-		// Prepare the base arguments for the `bucardo add sync` command.
 		args := []string{
 			command, "sync", sync.Name,
+			// Onetimecopy is a common setting to update.
 			fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
 		}
 
@@ -345,58 +345,69 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 			// Create a dbgroup for the bidirectional sync.
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
-			// Only create/update the dbgroup if we are adding the sync or if it's a full update.
-			if !exists { // For simplicity, we recreate the dbgroup when adding.
-				runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
-				var dbgroupArgs []string
-				for _, dbID := range sync.Bidirectional {
-					// For multi-master, all databases in the group are sources.
-					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", dbID))
-				}
-				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupArgs...)...)
+			// Always ensure the dbgroup is up-to-date.
+			log.Printf("[CONTAINER] Re-creating dbgroup '%s' to ensure it matches configuration.", dbgroupName)
+			runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
+			dbgroupMembers := make([]string, len(sync.Bidirectional))
+			for i, dbID := range sync.Bidirectional {
+				dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
 			}
+			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
 
 			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
-			if sync.Tables != "" {
+
+			// Tables can only be set on 'add'.
+			if command == "add" && sync.Tables != "" {
 				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
+			} else if command == "update" && sync.Tables != "" {
+				log.Printf("[WARNING] Sync '%s': The 'tables' property cannot be changed on an existing sync. This setting will be ignored. To apply, the sync must be manually deleted and re-created.", sync.Name)
 			}
 
 		} else if len(sync.Sources) > 0 && len(sync.Targets) > 0 {
 			// Handle standard source -> target sync
-			var dbStrings []string
-			for _, sourceID := range sync.Sources {
-				dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
+			if command == "add" {
+				// For 'add', we can pass the list of dbs directly.
+				var dbStrings []string
+				for _, sourceID := range sync.Sources {
+					dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
+				}
+				for _, targetID := range sync.Targets {
+					dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
+				}
+				dbsArg := strings.Join(dbStrings, ",")
+				args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
+			} else { // command == "update"
+				// The "swap and replace" method for updating a dbgroup without data loss.
+				// 1. Create a new, temporary dbgroup with the correct members.
+				tempDbgroupName := fmt.Sprintf("sg_%s_%d", sync.Name, time.Now().Unix())
+				log.Printf("[CONTAINER] Creating temporary dbgroup '%s' for sync update.", tempDbgroupName)
+				var dbgroupArgs []string
+				for _, sourceID := range sync.Sources {
+					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", sourceID))
+				}
+				for _, targetID := range sync.Targets {
+					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:target", targetID))
+				}
+				runBucardoCommand(append([]string{"add", "dbgroup", tempDbgroupName}, dbgroupArgs...)...)
+
+				// 2. Atomically update the sync to use the new dbgroup.
+				args = append(args, fmt.Sprintf("dbs=%s", tempDbgroupName))
 			}
-			for _, targetID := range sync.Targets {
-				dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
-			}
-			dbsArg := strings.Join(dbStrings, ",")
-			args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
 
 			// For standard syncs, we need either a herd or a list of tables.
-			if sync.Herd != "" {
+			// These can only be set on 'add'.
+			if command == "add" && sync.Herd != "" {
 				log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
 				sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
-
-				// Only create the herd if we are adding the sync. Updating a herd is complex.
-				if !exists {
-					runBucardoCommand("del", "herd", sync.Herd, "--force")
-					runBucardoCommand("add", "herd", sync.Herd)
-					runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
-				}
-
+				runBucardoCommand("del", "herd", sync.Herd, "--force")
+				runBucardoCommand("add", "herd", sync.Herd)
+				runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 				args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
-			} else if sync.Tables != "" {
+			} else if command == "add" && sync.Tables != "" {
 				log.Println("[CONTAINER] Using table list")
-				// Prevent users from accidentally trying to sync all tables via the 'tables' field.
-				trimmedTables := strings.ToLower(strings.TrimSpace(sync.Tables))
-				if trimmedTables == "all" || trimmedTables == "*" {
-					log.Fatalf("Error in sync '%s': The 'tables' field cannot be 'all' or '*'. To sync all tables from a source, please use the 'herd' option instead. See the README for more details.", sync.Name)
-				}
 				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
-			} else {
-				log.Printf("[WARNING] Sync '%s' has no 'herd' or 'tables' defined. Skipping.", sync.Name)
-				continue
+			} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
+				log.Printf("[WARNING] Sync '%s': The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored. To apply, the sync must be manually deleted and re-created.", sync.Name)
 			}
 		}
 
@@ -420,6 +431,13 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		// Execute the command and apply customizations
 		if err := runBucardoCommand(args...); err != nil {
 			log.Fatalf("Failed to %s sync %s: %v", command, sync.Name, err)
+		}
+
+		// If we just successfully updated a standard sync, we can now safely clean up the old dbgroup.
+		if command == "update" && len(sync.Sources) > 0 {
+			// This is now safe because the sync has been updated to point to the new temporary dbgroup.
+			log.Printf("[CONTAINER] Cleaning up old dbgroup '%s'.", sync.Name)
+			runBucardoCommand("del", "dbgroup", sync.Name, "--force")
 		}
 	}
 }
