@@ -533,7 +533,7 @@ type CronJob struct {
 }
 
 // runCronScheduler sets up and runs a cron scheduler for syncs with a 'cron' property.
-func runCronScheduler(jobs []CronJob) {
+func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 	c := cron.New()
 	var runOnceJob *CronJob // Special handling for the first job with exit_on_complete
 
@@ -573,8 +573,19 @@ func runCronScheduler(jobs []CronJob) {
 		nextRun := schedule.Next(time.Now())
 		log.Printf("[CRON] Sync '%s' is a run-once job. It will run next at %s and then the container will exit upon completion.", runOnceJob.SyncName, nextRun.Format(time.RFC1123))
 
-		// Wait until the next scheduled time.
-		time.Sleep(time.Until(nextRun))
+		// Wait until the next scheduled time, but listen for shutdown signals.
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		timer := time.NewTimer(time.Until(nextRun))
+
+		select {
+		case <-timer.C:
+			// Time to run the job.
+		case sig := <-sigs:
+			log.Printf("[CONTAINER] Received signal %s while waiting for scheduled job. Shutting down.", sig)
+			stopBucardo()
+			os.Exit(0)
+		}
 
 		// Kick the sync.
 		log.Printf("[CRON] Kicking one-time sync '%s'", runOnceJob.SyncName)
@@ -589,9 +600,8 @@ func runCronScheduler(jobs []CronJob) {
 
 		// Now, monitor this single sync for completion.
 		// We create a temporary config and sync map for monitorSyncs.
-		dummyConfig := &BucardoConfig{LogLevel: "VERBOSE"} // Assume VERBOSE for monitoring
 		syncsToWatch := map[string]bool{runOnceJob.SyncName: true}
-		monitorSyncs(dummyConfig, syncsToWatch, runOnceJob.Timeout)
+		monitorSyncs(config, syncsToWatch, runOnceJob.Timeout)
 		log.Println("[CRON] Run-once job complete. Exiting.")
 		return // Exit the application.
 	}
@@ -668,7 +678,7 @@ func main() {
 
 	// Priority 1: If there are cron jobs, the cron scheduler takes over.
 	if len(cronJobs) > 0 {
-		runCronScheduler(cronJobs)
+		runCronScheduler(config, cronJobs)
 		// Priority 2: If there are non-cron run-once syncs, monitor them for completion.
 	} else if len(runOnceSyncs) > 0 {
 		monitorSyncs(config, runOnceSyncs, maxTimeout)

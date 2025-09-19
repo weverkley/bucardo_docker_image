@@ -69,7 +69,7 @@ First, create a `bucardo.json` configuration file. The container will mount and 
       },{
         "sources": [1,2],
         "targets": [3],
-        "tables": "product, order",
+        "tables": "product,orders",
         "onetimecopy": 0,
         "exit_on_complete": false
       }
