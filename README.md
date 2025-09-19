@@ -1,4 +1,4 @@
-# Bucardo Docker Image
+# Bucardo Docker
 
 This repository provides a Docker image for [Bucardo](https://bucardo.org/), a powerful asynchronous multi-master replication system for PostgreSQL. The image is based on Ubuntu and is automatically built and published to Docker Hub.
 
@@ -10,7 +10,8 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 * [Usage](#usage)
   * Quick Start with Docker Compose
   * Configuration (`bucardo.json`)
-  * Advanced Usage
+* Configuration Reference
+* Examples
 * Troubleshooting
 * [Copyright and License](#copyright-and-license)
 
@@ -19,6 +20,7 @@ This repository provides a Docker image for [Bucardo](https://bucardo.org/), a p
 ## Features
 - **Declarative Configuration**: Define all your databases and synchronization tasks in a single `bucardo.json` file.
 - **Environment Variable Support**: Keep your database passwords secure by loading them from environment variables.
+- **Bidirectional Replication**: Easily configure multi-master replication.
 - **Flexible Sync Definitions**: Sync all tables from a source (`herd`) or specify a list of tables (`tables`).
 - **Detailed Logging**: Control Bucardo's log verbosity to get real-time insight into replication.
 - **Run-Once Mode**: An option to have the container exit automatically after a successful sync, perfect for batch jobs.
@@ -83,7 +85,18 @@ First, create a `bucardo.json` configuration file. The container will mount and 
 
   * Once your databases are described, you must describe your *syncs*;
 
-  * Each sync must have one or more *sources*, and one or more *targets*; and these have to be described following JSON standard Array notation;
+  * You can define a sync as either standard (source-to-target) or bidirectional (multi-master).
+    - **Standard Syncs**: Use the `sources` and `targets` properties with arrays of database IDs.
+    - **Bidirectional Syncs**: Use the `bidirectional` property with an array of two or more database IDs. This creates a multi-master replication group where all databases sync with each other. When `bidirectional` is used, the `sources` and `targets` properties are ignored. The `tables` property is required, and using a `conflict_strategy` like `bucardo_latest` is highly recommended.
+
+      ```jsonc
+      {
+        "bidirectional": [1, 2],
+        "tables": "public.users, public.products",
+        "onetimecopy": 2,
+        "conflict_strategy": "bucardo_latest"
+      }
+      ```
 
   * Each entity inside the *sources* and *targets* arrays represents an *ID* referring to the databases described beforehand;
 
