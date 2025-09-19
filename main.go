@@ -66,9 +66,14 @@ func runCommand(logCmd, name string, arg ...string) error {
 
 // runBucardoCommand is a helper to execute a `bucardo` command as the 'postgres' user.
 func runBucardoCommand(args ...string) error {
-	bucardoCmdStr := fmt.Sprintf("bucardo %s", strings.Join(args, " "))
-	fullArgs := []string{"-", "postgres", "-c", bucardoCmdStr}
-	return runCommand(bucardoCmdStr, "su", fullArgs...)
+	// Prepend "bucardo" to the arguments to form the full command.
+	fullBucardoCmd := append([]string{"bucardo"}, args...)
+
+	// Construct the command string for logging purposes only.
+	logCmdStr := strings.Join(fullBucardoCmd, " ")
+
+	// Execute `su - postgres -c "bucardo arg1 arg2 ..."` but pass arguments safely.
+	return runCommand(logCmdStr, "su", "-", "postgres", "-c", strings.Join(fullBucardoCmd, " "))
 }
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
@@ -130,9 +135,40 @@ func getDbPassword(db Database) (string, error) {
 	return db.Pass, nil
 }
 
+// setupPgpassFile creates or appends to a .pgpass file for the postgres user.
+// This is the most robust way to handle passwords with special characters.
+func setupPgpassFile(db Database, password string) error {
+	// Format: hostname:port:database:username:password
+	// Use '*' for port/database to match any.
+	port := "*"
+	if db.Port != nil {
+		port = fmt.Sprintf("%d", *db.Port)
+	}
+	pgpassEntry := fmt.Sprintf("%s:%s:%s:%s:%s\n", db.Host, port, db.DBName, db.User, password)
+
+	// The .pgpass file must be owned by the user running the command (postgres)
+	// and have permissions 0600. We write it to the postgres user's home directory.
+	pgpassPath := "/var/lib/postgresql/.pgpass"
+	f, err := os.OpenFile(pgpassPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open .pgpass file: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(pgpassEntry); err != nil {
+		return fmt.Errorf("failed to write to .pgpass file: %w", err)
+	}
+
+	// Ensure the file is owned by the postgres user.
+	return runCommand("", "chown", "postgres:postgres", pgpassPath)
+}
+
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
 	log.Println("[CONTAINER] Adding databases to Bucardo...")
+	// Clear any existing .pgpass file to start fresh.
+	os.Remove("/var/lib/postgresql/.pgpass")
+
 	for _, db := range config.Databases {
 		log.Printf("[CONTAINER] Adding db %s (id: %d)", db.DBName, db.ID)
 
@@ -144,19 +180,22 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			log.Fatalf("Error getting password for db id %d: %v", db.ID, err)
 		}
 
-		args := []string{
-			"add", "db", dbName,
-			"--force",
-			fmt.Sprintf("dbname=%s", db.DBName),
-			fmt.Sprintf("user='%s'", db.User),
-			fmt.Sprintf("pass='%s'", password),
-			fmt.Sprintf("host=%s", db.Host),
+		// Add the password to the .pgpass file to avoid command-line parsing issues.
+		if err := setupPgpassFile(db, password); err != nil {
+			log.Fatalf("Failed to set up .pgpass for db %s: %v", dbName, err)
 		}
 
+		// Build the arguments for bucardo, omitting the password.
+		// Bucardo will automatically use the .pgpass file.
+		args := []string{
+			"add", "db", dbName, "--force",
+			fmt.Sprintf("dbname=%s", db.DBName),
+			fmt.Sprintf("host=%s", db.Host),
+			fmt.Sprintf("user=%s", db.User),
+		}
 		if db.Port != nil {
 			args = append(args, fmt.Sprintf("port=%d", *db.Port))
 		}
-
 		if err := runBucardoCommand(args...); err != nil {
 			log.Fatalf("Failed to add database %s: %v", dbName, err)
 		}
@@ -493,6 +532,11 @@ func main() {
 	// Main startup sequence.
 	startPostgres()
 	setLogLevel(config)
+
+	// The .pgpass file needs to exist with the right permissions before Bucardo uses it.
+	// We touch it here and set permissions, even if it's empty initially.
+	runCommand("", "touch", "/var/lib/postgresql/.pgpass")
+	runCommand("", "chmod", "0600", "/var/lib/postgresql/.pgpass")
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
