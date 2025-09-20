@@ -254,6 +254,33 @@ func databaseExists(dbName string) bool {
 	return strings.Contains(string(output), searchString)
 }
 
+// listBucardoDbs returns a slice of all database names currently configured in Bucardo.
+func listBucardoDbs() ([]string, error) {
+	re := regexp.MustCompile(`Database: (\S+)`)
+
+	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list dbs")
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		if strings.Contains(outputStr, "No databases found") {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to execute 'bucardo list dbs': %w. Output: %s", err, outputStr)
+	}
+
+	matches := re.FindAllStringSubmatch(outputStr, -1)
+	if matches == nil {
+		return []string{}, nil // No databases found
+	}
+
+	var dbs []string
+	for _, match := range matches {
+		dbs = append(dbs, match[1])
+	}
+	return dbs, nil
+}
+
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
 	logger.Info("Adding/updating databases in Bucardo...")
@@ -308,6 +335,33 @@ func syncExists(syncName string) bool {
 	// The output format is 'Sync "<name>" ...'. Using quotes prevents partial matches.
 	searchString := fmt.Sprintf("Sync \"%s\"", syncName)
 	return strings.Contains(string(output), searchString)
+}
+
+// listBucardoSyncs returns a slice of all sync names currently configured in Bucardo.
+func listBucardoSyncs() ([]string, error) {
+	re := regexp.MustCompile(`Sync "([^"]+)"`)
+
+	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list syncs")
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		if strings.Contains(outputStr, "No syncs found") {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to execute 'bucardo list syncs': %w. Output: %s", err, outputStr)
+	}
+
+	matches := re.FindAllStringSubmatch(outputStr, -1)
+	if matches == nil {
+		return []string{}, nil // No syncs found
+	}
+
+	var syncs []string
+	for _, match := range matches {
+		syncs = append(syncs, match[1])
+	}
+	return syncs, nil
 }
 
 // getSyncDbgroup finds the name of the dbgroup currently associated with a sync by parsing command output.
@@ -378,8 +432,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		} else if len(sync.Sources) > 0 && len(sync.Targets) > 0 {
 			// Handle standard source -> target sync
-			if command == "add" {
-				// For 'add', we can pass the list of dbs directly.
+			if command == "add" { // For 'add', we can pass the list of dbs directly.
 				var dbStrings []string
 				for _, sourceID := range sync.Sources {
 					dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
@@ -775,6 +828,61 @@ func setupAllPgpass(config *BucardoConfig) {
 	}
 }
 
+// removeOrphanedDbs compares the databases in the config with those in Bucardo
+// and removes any databases from Bucardo that are not declared in the config.
+func removeOrphanedDbs(config *BucardoConfig) {
+	logger.Info("Checking for orphaned databases to remove...")
+
+	// 1. Get all database names declared in the config file (e.g., "db1", "db2").
+	configDbs := make(map[string]bool)
+	for _, db := range config.Databases {
+		dbName := fmt.Sprintf("db%d", db.ID)
+		configDbs[dbName] = true
+	}
+
+	// 2. Get all database names currently existing in Bucardo.
+	bucardoDbs, err := listBucardoDbs()
+	if err != nil {
+		logger.Error("Could not list existing Bucardo databases for cleanup", "error", err)
+		return // Skip cleanup if we can't get the list.
+	}
+
+	// 3. Compare and delete any database from Bucardo that is not in the config.
+	for _, bucardoDbName := range bucardoDbs {
+		if !configDbs[bucardoDbName] {
+			logger.Info("Removing orphaned database not found in configuration", "name", bucardoDbName)
+			runBucardoCommand("del", "db", bucardoDbName)
+		}
+	}
+}
+
+// removeOrphanedSyncs compares the syncs in the config with those in Bucardo
+// and removes any syncs from Bucardo that are not declared in the config.
+func removeOrphanedSyncs(config *BucardoConfig) {
+	logger.Info("Checking for orphaned syncs to remove...")
+
+	// 1. Get all sync names declared in the config file.
+	configSyncs := make(map[string]bool)
+	for _, sync := range config.Syncs {
+		configSyncs[sync.Name] = true
+	}
+
+	// 2. Get all sync names currently existing in Bucardo.
+	bucardoSyncs, err := listBucardoSyncs()
+	if err != nil {
+		logger.Error("Could not list existing Bucardo syncs for cleanup", "error", err)
+		return // Skip cleanup if we can't get the list.
+	}
+
+	// 3. Compare and delete any sync from Bucardo that is not in the config.
+	for _, bucardoSyncName := range bucardoSyncs {
+		if !configSyncs[bucardoSyncName] {
+			logger.Info("Removing orphaned sync not found in configuration", "name", bucardoSyncName)
+			runBucardoCommand("del", "sync", bucardoSyncName)
+		}
+	}
+}
+
 func main() {
 	// Use a structured JSON logger for better log management.
 	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -809,6 +917,8 @@ func main() {
 	setupAllPgpass(config)
 	defer os.Remove(pgpassPath) // Ensure the password file is removed on exit.
 
+	removeOrphanedDbs(config)
+	removeOrphanedSyncs(config)
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
