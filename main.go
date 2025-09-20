@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/robfig/cron/v3"
 )
+
+var logger *slog.Logger
 
 const (
 	// bucardoLogPath is the default location for the Bucardo log file inside the container.
@@ -71,7 +74,7 @@ func runCommand(logCmd, name string, arg ...string) error {
 	if logCmd == "" {
 		logCmd = cmd.String()
 	}
-	log.Printf("Running command: %s", logCmd)
+	logger.Info("Running command", "command", logCmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -88,27 +91,28 @@ func runBucardoCommand(args ...string) error {
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
 func startPostgres() {
-	log.Println("[CONTAINER] Starting PostgreSQL...")
+	logger.Info("Starting PostgreSQL...")
 	if err := runCommand("", "service", "postgresql", "start"); err != nil {
-		log.Fatalf("Failed to start postgresql service: %v", err)
+		logger.Error("Failed to start postgresql service", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("[CONTAINER] Waiting for Bucardo to be ready...")
+	logger.Info("Waiting for Bucardo to be ready...")
 	// Wait for Bucardo to be ready, with a timeout.
 	const readinessTimeout = 2 * time.Minute
-	ctx, cancel := context.WithTimeout(context.Background(), readinessTimeout)
-	defer cancel()
+	deadline := time.Now().Add(readinessTimeout)
 
-	for ctx.Err() == nil {
+	for time.Now().Before(deadline) {
 		// We check the output of `bucardo status` to see if it's ready.
 		cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo status")
 		if err := cmd.Run(); err == nil {
-			log.Println("[CONTAINER] Bucardo is ready.")
+			logger.Info("Bucardo is ready.")
 			return
 		}
 		time.Sleep(5 * time.Second)
 	}
-	log.Fatalf("[ERROR] Bucardo did not become ready within %v.", readinessTimeout)
+	logger.Error("Bucardo did not become ready within timeout", "timeout", readinessTimeout)
+	os.Exit(1)
 }
 
 // loadConfig reads and parses the bucardo.json file.
@@ -255,9 +259,7 @@ func databaseExists(dbName string) bool {
 
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
-	log.Println("[CONTAINER] Adding/updating databases in Bucardo...")
-	// Clear any existing .pgpass file to start fresh.
-	os.Remove(pgpassPath)
+	logger.Info("Adding/updating databases in Bucardo...")
 
 	for _, db := range config.Databases {
 		dbName := fmt.Sprintf("db%d", db.ID)
@@ -266,19 +268,15 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 
 		if exists {
 			command = "update"
-			log.Printf("[CONTAINER] Updating existing db '%s' (id: %d, host: %s)", dbName, db.ID, db.Host)
+			logger.Info("Updating existing db", "name", dbName, "id", db.ID, "host", db.Host)
 		} else {
-			log.Printf("[CONTAINER] Adding new db '%s' (id: %d, host: %s)", dbName, db.ID, db.Host)
+			logger.Info("Adding new db", "name", dbName, "id", db.ID, "host", db.Host)
 		}
 
-		password, err := getDbPassword(db)
+		_, err := getDbPassword(db)
 		if err != nil {
-			log.Fatalf("Error getting password for db id %d: %v", db.ID, err)
-		}
-
-		// Re-create the .pgpass file with the current configuration.
-		if err := setupPgpassFile(db, password); err != nil {
-			log.Fatalf("Failed to set up .pgpass for db %s: %v", dbName, err)
+			logger.Error("Error getting password for db", "id", db.ID, "error", err)
+			os.Exit(1)
 		}
 
 		// Build the arguments for bucardo, omitting the password.
@@ -293,7 +291,8 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			args = append(args, fmt.Sprintf("port=%d", *db.Port))
 		}
 		if err := runBucardoCommand(args...); err != nil {
-			log.Fatalf("Failed to %s database %s: %v", command, dbName, err)
+			logger.Error("Failed to modify database", "action", command, "name", dbName, "error", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -306,7 +305,7 @@ func syncExists(syncName string) bool {
 	output, err := cmd.Output()
 	if err != nil {
 		// If the command itself fails, we can't determine existence. Log and assume it doesn't exist.
-		log.Printf("[WARNING] Could not list Bucardo syncs to check for existence: %v", err)
+		logger.Warn("Could not list Bucardo syncs to check for existence", "error", err)
 		return false
 	}
 
@@ -337,21 +336,21 @@ func getSyncDbgroup(syncName string) (string, error) {
 	}
 
 	// If we are here, parsing failed. Log the output for debugging.
-	log.Printf("[DEBUG] Bucardo output for 'list sync %s':\n---\n%s\n---", syncName, outputStr)
+	logger.Debug("Bucardo output for 'list sync'", "sync", syncName, "output", outputStr)
 	return "", fmt.Errorf("could not find 'DB group \"<name>\"' pattern in output for sync '%s'", syncName)
 }
 
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
-	log.Println("[CONTAINER] Adding syncs to Bucardo...")
+	logger.Info("Adding syncs to Bucardo...")
 	for _, sync := range config.Syncs {
 		exists := syncExists(sync.Name)
 		command := "add"
 		if exists {
 			command = "update"
-			log.Printf("[CONTAINER] Updating existing sync '%s' in Bucardo...", sync.Name)
+			logger.Info("Updating existing sync", "name", sync.Name)
 		} else {
-			log.Printf("[CONTAINER] Adding new sync '%s' to Bucardo...", sync.Name)
+			logger.Info("Adding new sync", "name", sync.Name)
 		}
 
 		args := []string{
@@ -364,12 +363,12 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		if len(sync.Bidirectional) > 0 {
 			// Handle bidirectional (multi-master) sync using a dbgroup.
-			log.Printf("[CONTAINER] Configuring bidirectional sync for dbs: %v", sync.Bidirectional)
+			logger.Info("Configuring bidirectional sync", "dbs", sync.Bidirectional)
 
 			// Create a dbgroup for the bidirectional sync.
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
 			// Always ensure the dbgroup is up-to-date.
-			log.Printf("[CONTAINER] Re-creating dbgroup '%s' to ensure it matches configuration.", dbgroupName)
+			logger.Info("Re-creating dbgroup to ensure it matches configuration", "name", dbgroupName)
 			runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
 			dbgroupMembers := make([]string, len(sync.Bidirectional))
 			for i, dbID := range sync.Bidirectional {
@@ -383,7 +382,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			if command == "add" && sync.Tables != "" {
 				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
 			} else if command == "update" && sync.Tables != "" {
-				log.Printf("[WARNING] Sync '%s': The 'tables' property cannot be changed on an existing sync. This setting will be ignored. To apply, the sync must be manually deleted and re-created.", sync.Name)
+				logger.Warn("The 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
 			}
 
 		} else if len(sync.Sources) > 0 && len(sync.Targets) > 0 {
@@ -404,12 +403,13 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				// 0. Find the name of the dbgroup currently used by the sync.
 				oldDbgroupName, err := getSyncDbgroup(sync.Name)
 				if err != nil {
-					log.Fatalf("Failed to determine current dbgroup for sync '%s': %v", sync.Name, err)
+					logger.Error("Failed to determine current dbgroup for sync", "name", sync.Name, "error", err)
+					os.Exit(1)
 				}
 
 				// 1. Create a new, temporary dbgroup with the correct members.
 				tempDbgroupName := fmt.Sprintf("sg_%s_%d", sync.Name, time.Now().Unix())
-				log.Printf("[CONTAINER] Creating temporary dbgroup '%s' for sync update.", tempDbgroupName)
+				logger.Info("Creating temporary dbgroup for sync update", "name", tempDbgroupName)
 				var dbgroupArgs []string
 				for _, sourceID := range sync.Sources {
 					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", sourceID))
@@ -426,9 +426,9 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				defer func(groupToDelete string) {
 					// This check is important. If the old group was the same as the new one (unlikely but possible), don't delete it.
 					if groupToDelete != tempDbgroupName {
-						log.Printf("[CONTAINER] Cleaning up old dbgroup '%s'.", groupToDelete)
+						logger.Info("Cleaning up old dbgroup", "name", groupToDelete)
 						if err := runBucardoCommand("del", "dbgroup", groupToDelete, "--force"); err != nil {
-							log.Printf("[WARNING] Failed to clean up old dbgroup '%s': %v", groupToDelete, err)
+							logger.Warn("Failed to clean up old dbgroup", "name", groupToDelete, "error", err)
 						}
 					}
 				}(oldDbgroupName)
@@ -437,17 +437,17 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			// For standard syncs, we need either a herd or a list of tables.
 			// These can only be set on 'add'.
 			if command == "add" && sync.Herd != "" {
-				log.Printf("[CONTAINER] Using herd: %s", sync.Herd)
+				logger.Info("Using herd", "name", sync.Herd)
 				sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
 				runBucardoCommand("del", "herd", sync.Herd, "--force")
 				runBucardoCommand("add", "herd", sync.Herd)
 				runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 				args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
 			} else if command == "add" && sync.Tables != "" {
-				log.Println("[CONTAINER] Using table list")
+				logger.Info("Using table list")
 				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
 			} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
-				log.Printf("[WARNING] Sync '%s': The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored. To apply, the sync must be manually deleted and re-created.", sync.Name)
+				logger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
 			}
 		}
 
@@ -470,7 +470,8 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		// Execute the command and apply customizations
 		if err := runBucardoCommand(args...); err != nil {
-			log.Fatalf("Failed to %s sync %s: %v", command, sync.Name, err)
+			logger.Error("Failed to modify sync", "action", command, "name", sync.Name, "error", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -488,9 +489,9 @@ func streamBucardoLog() *exec.Cmd {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	log.Printf("[CONTAINER] Streaming Bucardo log file: %s", bucardoLogPath)
+	logger.Info("Streaming Bucardo log file", "path", bucardoLogPath)
 	if err := cmd.Start(); err != nil {
-		log.Printf("[WARNING] Could not start streaming Bucardo log file: %v", err)
+		logger.Warn("Could not start streaming Bucardo log file", "error", err)
 		return nil
 	}
 
@@ -500,38 +501,38 @@ func streamBucardoLog() *exec.Cmd {
 
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
-	log.Println("[CONTAINER] Starting Bucardo...")
+	logger.Info("Starting Bucardo...")
 	// Before starting, ensure any stale Bucardo processes from an unclean shutdown are stopped.
-	log.Println("[CONTAINER] Checking for and stopping any stale Bucardo processes...")
+	logger.Info("Checking for and stopping any stale Bucardo processes...")
 	stopBucardo() // Use our robust stop function.
 
 	if err := runBucardoCommand("start"); err != nil {
-		log.Fatalf("Failed to start bucardo: %v", err)
+		logger.Error("Failed to start bucardo", "error", err)
+		os.Exit(1)
 	}
 }
 
 // stopBucardo gracefully stops the Bucardo service and waits for confirmation.
 func stopBucardo() {
-	log.Println("[CONTAINER] Stopping Bucardo...")
+	logger.Info("Stopping Bucardo...")
 	if err := runBucardoCommand("stop"); err != nil {
-		log.Printf("[WARNING] 'bucardo stop' command failed: %v", err)
+		logger.Warn("'bucardo stop' command failed", "error", err)
 	}
 
-	log.Println("[CONTAINER] Waiting for Bucardo to stop completely...")
+	logger.Info("Waiting for Bucardo to stop completely...")
 	const shutdownTimeout = 30 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	deadline := time.Now().Add(shutdownTimeout)
 
-	for ctx.Err() == nil {
+	for time.Now().Before(deadline) {
 		// The absence of the MCP PID file is the most reliable way to confirm a clean stop.
 		if _, err := os.Stat("/var/run/bucardo/bucardo.mcp.pid"); os.IsNotExist(err) {
-			log.Println("[CONTAINER] Bucardo has stopped.")
+			logger.Info("Bucardo has stopped.")
 			return
 		}
 		time.Sleep(1 * time.Second)
 	}
 
-	log.Printf("[ERROR] Bucardo did not stop gracefully within %v. The process may be hung.", shutdownTimeout)
+	logger.Error("Bucardo did not stop gracefully within timeout. The process may be hung.", "timeout", shutdownTimeout)
 }
 
 // monitorBucardo handles the default long-running mode. It streams logs and waits for a
@@ -540,7 +541,7 @@ func monitorBucardo() {
 	tailCmd := streamBucardoLog()
 	if tailCmd != nil && tailCmd.Process != nil {
 		defer func() {
-			log.Println("[CONTAINER] Stopping log streamer...")
+			logger.Info("Stopping log streamer...")
 			// Kill the process group to ensure tail and any children are stopped.
 			syscall.Kill(-tailCmd.Process.Pid, syscall.SIGKILL)
 		}()
@@ -553,7 +554,7 @@ func monitorBucardo() {
 	for {
 		select {
 		case sig := <-sigs:
-			log.Printf("[CONTAINER] Received signal %s, shutting down.", sig)
+			logger.Info("Received signal, shutting down.", "signal", sig)
 			stopBucardo()
 			return
 		}
@@ -565,12 +566,12 @@ func monitorBucardo() {
 // down the container upon completion. Otherwise, it transitions to long-running mode.
 func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeout *int) {
 	if config.LogLevel != "VERBOSE" && config.LogLevel != "DEBUG" {
-		log.Printf("[WARNING] 'exit_on_complete' is true, but 'log_level' is not 'VERBOSE' or 'DEBUG'.")
-		log.Printf("[WARNING] The completion message may not be logged, and the container might time out or run indefinitely.")
+		logger.Warn("'exit_on_complete' is true, but 'log_level' is not 'VERBOSE' or 'DEBUG'.")
+		logger.Warn("The completion message may not be logged, and the container might time out or run indefinitely.")
 	}
 
 	if len(runOnceSyncs) > 0 {
-		log.Printf("[CONTAINER] Monitoring %d sync(s) for completion: %v", len(runOnceSyncs), getMapKeys(runOnceSyncs))
+		logger.Info("Monitoring sync(s) for completion", "count", len(runOnceSyncs), "syncs", getMapKeys(runOnceSyncs))
 	}
 
 	allSyncsAreRunOnce := len(config.Syncs) == len(runOnceSyncs)
@@ -585,7 +586,8 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	// Get a pipe to the command's stdout to read the log lines.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatalf("[ERROR] Could not create pipe for tail command: %v", err)
+		logger.Error("Could not create pipe for tail command", "error", err)
+		os.Exit(1)
 	}
 	cmd.Stderr = os.Stderr
 
@@ -595,12 +597,13 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("[ERROR] Could not start log tailing command: %v", err)
+		logger.Error("Could not start log tailing command", "error", err)
+		os.Exit(1)
 	}
 	// Set up the timeout if specified
 	if maxTimeout != nil && *maxTimeout > 0 {
 		timeoutDuration := time.Duration(*maxTimeout) * time.Second
-		log.Printf("[CONTAINER] Setting a timeout of %v for run-once sync completion.", timeoutDuration)
+		logger.Info("Setting a timeout for run-once sync completion", "timeout", timeoutDuration)
 		timeoutChannel = time.After(timeoutDuration)
 	}
 
@@ -623,7 +626,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 		select {
 		case line, ok := <-lineChan:
 			if !ok {
-				log.Println("[CONTAINER] Log streaming finished unexpectedly.")
+				logger.Info("Log streaming finished unexpectedly.")
 				// Kill the tail process group and wait for it to exit.
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				cmd.Wait()
@@ -635,29 +638,29 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 			if strings.Contains(line, "exiting at cleanup_kid") && strings.Contains(line, "Reason: Normal exit") {
 				for syncName := range runOnceSyncs {
 					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) {
-						log.Printf("[CONTAINER] Completion message for sync '%s' detected.", syncName)
+						logger.Info("Completion message for sync detected", "sync", syncName)
 						if err := runBucardoCommand("stop", syncName); err != nil {
-							log.Printf("[WARNING] Failed to stop sync %s: %v", syncName, err)
+							logger.Warn("Failed to stop sync", "name", syncName, "error", err)
 						}
 						// Remove from the map of syncs we are waiting for.
 						delete(runOnceSyncs, syncName)
-						log.Printf("[CONTAINER] %d run-once sync(s) remaining.", len(runOnceSyncs))
+						logger.Info("Run-once sync(s) remaining", "count", len(runOnceSyncs))
 					}
 				}
 			}
 
 			// If we were waiting for syncs and now the map is empty, we are done.
 			if len(runOnceSyncs) == 0 {
-				log.Println("[CONTAINER] All monitored syncs have completed.")
+				logger.Info("All monitored syncs have completed.")
 				if allSyncsAreRunOnce {
-					log.Println("[CONTAINER] All configured syncs were run-once. Shutting down container.")
+					logger.Info("All configured syncs were run-once. Shutting down container.")
 					cancel()                                        // Stop the scanner goroutine.
 					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group.
 					stopBucardo()
 					return // Success.
 				} else {
 					// Some syncs were run-once, but others are long-running. Switch to standard monitoring.
-					log.Println("[CONTAINER] Other syncs are still running. Switching to standard monitoring mode.")
+					logger.Info("Other syncs are still running. Switching to standard monitoring mode.")
 					cancel()
 					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 					monitorBucardo() // Hand off to the long-running monitor
@@ -665,7 +668,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 				}
 			}
 		case <-timeoutChannel:
-			log.Printf("[ERROR] Timeout of %d seconds reached. The following syncs did not complete: %v", *maxTimeout, getMapKeys(runOnceSyncs))
+			logger.Error("Timeout reached for run-once syncs", "timeout_seconds", *maxTimeout, "incomplete_syncs", getMapKeys(runOnceSyncs))
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group.
 			stopBucardo()
 			os.Exit(1) // Exit with a non-zero status code to indicate failure.
@@ -676,10 +679,10 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 // setLogLevel sets the global Bucardo logging level if specified in the config.
 func setLogLevel(config *BucardoConfig) {
 	if config.LogLevel != "" {
-		log.Printf("[CONTAINER] Setting Bucardo log level to: %s", config.LogLevel)
+		logger.Info("Setting Bucardo log level", "level", config.LogLevel)
 		if err := runBucardoCommand("set", fmt.Sprintf("log_level=%s", config.LogLevel)); err != nil {
 			// Log as a warning as Bucardo can still run with the default log level.
-			log.Printf("[WARNING] Failed to set log_level: %v", err)
+			logger.Warn("Failed to set log_level", "error", err)
 		}
 	}
 }
@@ -714,21 +717,21 @@ func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 			if runOnceJob == nil {
 				runOnceJob = &job
 			} else {
-				log.Printf("[WARNING] Multiple cron syncs have 'exit_on_complete: true'. Only the first one ('%s') will cause an exit. The others will run on their schedule but will not trigger an exit.", runOnceJob.SyncName)
+				logger.Warn("Multiple cron syncs have 'exit_on_complete: true'. Only the first one will cause an exit.", "first_sync", runOnceJob.SyncName)
 			}
 			continue // Don't add to the recurring scheduler
 		}
 
 		// This is a recurring cron job.
 		_, err := c.AddFunc(job.CronExpression, func() {
-			log.Printf("[CRON] Kicking sync '%s' as per schedule '%s'", job.SyncName, job.CronExpression)
+			logger.Info("Kicking sync as per schedule", "sync", job.SyncName, "schedule", job.CronExpression)
 			// We don't specify a timeout for recurring jobs, letting Bucardo handle it.
 			if err := runBucardoCommand("kick", job.SyncName, "0"); err != nil {
-				log.Printf("[ERROR] Failed to kick sync '%s': %v", job.SyncName, err)
+				logger.Error("Failed to kick sync", "sync", job.SyncName, "error", err)
 			}
 		})
 		if err != nil {
-			log.Printf("[ERROR] Failed to schedule cron job for sync '%s': %v. This sync will not run.", job.SyncName, err)
+			logger.Error("Failed to schedule cron job for sync. This sync will not run.", "sync", job.SyncName, "error", err)
 		}
 	}
 
@@ -736,11 +739,12 @@ func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 	if runOnceJob != nil {
 		schedule, err := cron.ParseStandard(runOnceJob.CronExpression)
 		if err != nil {
-			log.Fatalf("[ERROR] Invalid cron expression for sync '%s': %v", runOnceJob.SyncName, err)
+			logger.Error("Invalid cron expression for sync", "sync", runOnceJob.SyncName, "error", err)
+			os.Exit(1)
 		}
 
 		nextRun := schedule.Next(time.Now())
-		log.Printf("[CRON] Sync '%s' is a run-once job. It will run next at %s and then the container will exit upon completion.", runOnceJob.SyncName, nextRun.Format(time.RFC1123))
+		logger.Info("Scheduled run-once job. Container will exit upon completion.", "sync", runOnceJob.SyncName, "next_run", nextRun.Format(time.RFC1123))
 
 		// Wait until the next scheduled time, but listen for shutdown signals.
 		sigs := make(chan os.Signal, 1)
@@ -751,19 +755,19 @@ func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 		case <-timer.C:
 			// Time to run the job.
 		case sig := <-sigs:
-			log.Printf("[CONTAINER] Received signal %s while waiting for scheduled job. Shutting down.", sig)
+			logger.Info("Received signal while waiting for scheduled job. Shutting down.", "signal", sig)
 			stopBucardo()
 			os.Exit(0)
 		}
 
 		// Kick the sync.
-		log.Printf("[CRON] Kicking one-time sync '%s'", runOnceJob.SyncName)
+		logger.Info("Kicking one-time sync", "sync", runOnceJob.SyncName)
 		kickTimeout := "0" // Bucardo's default timeout
 		if runOnceJob.Timeout != nil {
 			kickTimeout = fmt.Sprintf("%d", *runOnceJob.Timeout)
 		}
 		if err := runBucardoCommand("kick", runOnceJob.SyncName, kickTimeout); err != nil {
-			log.Printf("[ERROR] Failed to kick sync '%s': %v. The container will now exit.", runOnceJob.SyncName, err)
+			logger.Error("Failed to kick sync. The container will now exit.", "sync", runOnceJob.SyncName, "error", err)
 			os.Exit(1)
 		}
 
@@ -771,13 +775,13 @@ func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 		// We create a temporary config and sync map for monitorSyncs.
 		syncsToWatch := map[string]bool{runOnceJob.SyncName: true}
 		monitorSyncs(config, syncsToWatch, runOnceJob.Timeout)
-		log.Println("[CRON] Run-once job complete. Exiting.")
+		logger.Info("Run-once job complete. Exiting.")
 		return // Exit the application.
 	}
 
 	// If we are here, there were no run-once jobs, so we run the scheduler indefinitely.
 	if len(c.Entries()) > 0 {
-		log.Printf("[CRON] Starting cron scheduler for %d recurring sync(s).", len(c.Entries()))
+		logger.Info("Starting cron scheduler for recurring sync(s).", "count", len(c.Entries()))
 		c.Start()
 
 		// Keep the application alive while the cron scheduler runs in the background.
@@ -786,39 +790,65 @@ func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
 		log.Println("[CRON] Shutting down cron scheduler.")
 		<-c.Stop().Done()
 	} else {
-		log.Println("[CONTAINER] No cron jobs were scheduled. The container will now exit as there is nothing to do.")
+		logger.Info("No cron jobs were scheduled. The container will now exit as there is nothing to do.")
+	}
+}
+
+// setupAllPgpass creates a single .pgpass file containing credentials for all databases.
+func setupAllPgpass(config *BucardoConfig) {
+	// Ensure we start with a clean slate.
+	os.Remove(pgpassPath)
+
+	for _, db := range config.Databases {
+		password, err := getDbPassword(db)
+		if err != nil {
+			logger.Error("Failed to get password for .pgpass setup", "db_id", db.ID, "error", err)
+			os.Exit(1)
+		}
+		if err := setupPgpassFile(db, password); err != nil {
+			logger.Error("Failed to write entry to .pgpass file", "db_id", db.ID, "error", err)
+			os.Exit(1)
+		}
 	}
 }
 
 func main() {
-	// Use a more granular timestamp for logs.
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// Use a structured logger for better log management.
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
 
 	if _, err := os.Stat(bucardoConfigPath); os.IsNotExist(err) {
-		log.Fatalf("[ERROR] Configuration file not found at %s. Please mount it as a volume.", bucardoConfigPath)
+		logger.Error("Configuration file not found. Please mount it as a volume.", "path", bucardoConfigPath)
+		os.Exit(1)
 	}
 
 	config, err := loadConfig()
 	if err != nil {
-		log.Fatalf("[ERROR] Failed to load configuration: %v", err)
+		logger.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
 	}
 
 	// Validate the configuration before proceeding.
 	if validationErrors := validateConfig(config); len(validationErrors) > 0 {
-		log.Println("[ERROR] Invalid configuration found in bucardo.json:")
+		logger.Error("Invalid configuration found in bucardo.json")
 		for _, e := range validationErrors {
-			log.Printf("- %v", e)
+			logger.Error(e.Error())
 		}
-		log.Fatal("Please fix the configuration errors and restart the container.")
+		logger.Error("Please fix the configuration errors and restart the container.")
+		os.Exit(1)
 	}
 
 	// Main startup sequence.
 	startPostgres()
 	setLogLevel(config)
-	// The .pgpass file needs to exist with the right permissions before Bucardo uses it.
-	// We touch it here and set permissions, even if it's empty initially.
-	runCommand("", "touch", "/var/lib/postgresql/.pgpass")
-	runCommand("", "chmod", "0600", "/var/lib/postgresql/.pgpass")
+
+	// Create the .pgpass file with all credentials. It will be used by subsequent bucardo commands.
+	setupAllPgpass(config)
+	// Defer the cleanup to ensure the password file is removed after all configuration is done.
+	defer os.Remove(pgpassPath)
+
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
