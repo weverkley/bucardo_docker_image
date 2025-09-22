@@ -17,8 +17,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/robfig/cron/v3"
 )
 
 // logger is the global structured logger for the application.
@@ -67,7 +65,6 @@ type Sync struct {
 	ExitOnComplete        *bool  `json:"exit_on_complete,omitempty"`         // If true, the container will exit after this sync completes.
 	ExitOnCompleteTimeout *int   `json:"exit_on_complete_timeout,omitempty"` // Timeout in seconds for run-once syncs.
 	ConflictStrategy      string `json:"conflict_strategy,omitempty"`        // Defines how to resolve data conflicts (e.g., "bucardo_source").
-	Cron                  string `json:"cron,omitempty"`                     // A cron expression (e.g., "0 2 * * *") for scheduled runs.
 }
 
 // runCommand executes a shell command, streaming its stdout and stderr.
@@ -496,11 +493,6 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			// stayalive=0 and kidsalive=0 ensure the sync does not persist after its initial run.
 			args = append(args, "stayalive=0", "kidsalive=0")
 		}
-		if sync.Cron != "" {
-			// autokick=0 prevents Bucardo's internal scheduler from running this sync.
-			// Our external cron scheduler will be responsible for kicking it.
-			args = append(args, "autokick=0")
-		}
 		if sync.StrictChecking != nil {
 			args = append(args, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
 		}
@@ -720,97 +712,6 @@ func getMapKeys(m map[string]bool) []string {
 	return keys
 }
 
-// CronJob represents a sync that is scheduled to run via a cron expression.
-type CronJob struct {
-	SyncName       string
-	CronExpression string
-	ExitOnComplete bool
-	Timeout        *int
-}
-
-// runCronScheduler sets up and runs a cron scheduler for syncs with a 'cron' property.
-func runCronScheduler(config *BucardoConfig, jobs []CronJob) {
-	c := cron.New()
-	var runOnceJob *CronJob // Special handling for the first job with exit_on_complete
-
-	for i := range jobs {
-		job := jobs[i] // Create a local copy for the closure
-
-		// A job marked for exit is handled separately and not added to the recurring scheduler.
-		if job.ExitOnComplete {
-			if runOnceJob == nil {
-				runOnceJob = &job
-			} else {
-				logger.Warn("Multiple cron syncs have 'exit_on_complete: true'. Only the first one will cause an exit.", "first_sync", runOnceJob.SyncName)
-			}
-			continue // Don't add to the recurring scheduler
-		}
-
-		_, err := c.AddFunc(job.CronExpression, func() {
-			logger.Info("Kicking sync as per schedule", "sync", job.SyncName, "schedule", job.CronExpression)
-			if err := runBucardoCommand("kick", job.SyncName, "0"); err != nil { // "0" is Bucardo's default timeout.
-				logger.Error("Failed to kick sync", "sync", job.SyncName, "error", err)
-			}
-		})
-		if err != nil {
-			logger.Error("Failed to schedule cron job for sync. This sync will not run.", "sync", job.SyncName, "error", err)
-		}
-	}
-
-	// Handle the single run-once job, if it exists.
-	if runOnceJob != nil {
-		schedule, err := cron.ParseStandard(runOnceJob.CronExpression)
-		if err != nil {
-			logger.Error("Invalid cron expression for sync", "sync", runOnceJob.SyncName, "error", err)
-			os.Exit(1)
-		}
-
-		nextRun := schedule.Next(time.Now())
-		logger.Info("Scheduled run-once job. Container will exit upon completion.", "sync", runOnceJob.SyncName, "next_run", nextRun.Format(time.RFC1123))
-
-		// Wait for the next scheduled time or a shutdown signal.
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		timer := time.NewTimer(time.Until(nextRun))
-
-		select {
-		case <-timer.C:
-			// Time to run the job.
-		case sig := <-sigs:
-			logger.Info("Received signal while waiting for scheduled job. Shutting down.", "signal", sig)
-			stopBucardo()
-			os.Exit(0)
-		}
-
-		logger.Info("Kicking one-time sync", "sync", runOnceJob.SyncName)
-		kickTimeout := "0" // Bucardo's default timeout
-		if runOnceJob.Timeout != nil {
-			kickTimeout = fmt.Sprintf("%d", *runOnceJob.Timeout)
-		}
-		if err := runBucardoCommand("kick", runOnceJob.SyncName, kickTimeout); err != nil {
-			logger.Error("Failed to kick sync. The container will now exit.", "sync", runOnceJob.SyncName, "error", err)
-			os.Exit(1)
-		}
-
-		// Monitor this single sync for completion.
-		syncsToWatch := map[string]bool{runOnceJob.SyncName: true}
-		monitorSyncs(config, syncsToWatch, runOnceJob.Timeout)
-		logger.Info("Run-once job complete. Exiting.")
-		return // Exit the application.
-	}
-
-	if len(c.Entries()) > 0 {
-		logger.Info("Starting cron scheduler for recurring sync(s).", "count", len(c.Entries()))
-		c.Start()
-
-		monitorBucardo()
-		log.Println("[CRON] Shutting down cron scheduler.")
-		<-c.Stop().Done()
-	} else {
-		logger.Info("No cron jobs were scheduled. The container will now exit as there is nothing to do.")
-	}
-}
-
 // setupAllPgpass creates a single .pgpass file containing credentials for all databases.
 func setupAllPgpass(config *BucardoConfig) {
 	os.Remove(pgpassPath)
@@ -923,10 +824,9 @@ func main() {
 	addSyncsToBucardo(config)
 	startBucardo()
 
-	// --- Determine execution mode: Cron, Run-Once, or Standard Long-Running ---
+	// --- Determine execution mode: Run-Once or Standard Long-Running ---
 
 	runOnceSyncs := make(map[string]bool)
-	cronJobs := []CronJob{}
 	var maxTimeout *int
 
 	for _, sync := range config.Syncs {
@@ -939,20 +839,9 @@ func main() {
 				}
 			}
 		}
-
-		if sync.Cron != "" {
-			cronJobs = append(cronJobs, CronJob{
-				SyncName:       sync.Name,
-				CronExpression: sync.Cron,
-				ExitOnComplete: sync.ExitOnComplete != nil && *sync.ExitOnComplete,
-				Timeout:        sync.ExitOnCompleteTimeout,
-			})
-		}
 	}
 
-	if len(cronJobs) > 0 {
-		runCronScheduler(config, cronJobs)
-	} else if len(runOnceSyncs) > 0 {
+	if len(runOnceSyncs) > 0 {
 		monitorSyncs(config, runOnceSyncs, maxTimeout)
 	} else {
 		monitorBucardo()

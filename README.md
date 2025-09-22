@@ -14,7 +14,6 @@ The image is designed for modern, declarative, and automated workflows. It uses 
 - **Multiple Execution Modes**:
   - **Long-Running**: The default mode for continuous replication.
   - **Run-Once**: The container performs a single sync and then exits, ideal for batch jobs.
-  - **Cron-Scheduled**: Trigger syncs based on a cron schedule, with support for both recurring and run-once cron jobs.
 - **Flexible Sync Types**:
   - **Source-to-Target**: Classic one-way replication.
   - **Bidirectional (Multi-Master)**: Easily configure two-way or multi-way replication.
@@ -123,7 +122,6 @@ The image is designed for modern, declarative, and automated workflows. It uses 
 | `conflict_strategy`        | `string` | _Optional._ Defines how to resolve data conflicts. Common values: `bucardo_source` (source wins), `bucardo_latest` (most recent change wins). -        |
 | `exit_on_complete`         | `bool`   | _Optional._ If `true`, the container performs a single sync and then exits. Ideal for batch jobs. Requires `log_level` of `VERBOSE` or `DEBUG`. -      |
 | `exit_on_complete_timeout` | `int`    | _Optional._ Timeout in seconds for a run-once sync. If the sync doesn't complete in time, the container exits with an error. -                         |
-| `cron`                     | `string` | _Optional._ A cron expression (e.g., `"0 2 * * *"`) to trigger the sync. This disables Bucardo's default timer and uses an internal scheduler. -       |
 
 ## Password Management
 
