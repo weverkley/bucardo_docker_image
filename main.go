@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -462,17 +464,29 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 			}
 		} else if len(sync.Sources) > 0 || len(sync.Targets) > 0 {
-			// For source-target syncs, Bucardo creates an implicit dbgroup.
-			// We just need to provide the list of dbs on add or update.
+			// For source-to-target syncs, we create a dbgroup with a deterministic name
+			// based on its members to ensure it's only recreated if the members change.
 			var dbStrings []string
+			var memberNames []string
 			for _, sourceID := range sync.Sources {
-				dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
+				member := fmt.Sprintf("db%d:source", sourceID)
+				dbStrings = append(dbStrings, member)
+				memberNames = append(memberNames, member)
 			}
 			for _, targetID := range sync.Targets {
-				dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
+				member := fmt.Sprintf("db%d:target", targetID)
+				dbStrings = append(dbStrings, member)
+				memberNames = append(memberNames, member)
 			}
-			dbsArg := strings.Join(dbStrings, ",")
-			args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
+			// Create a stable hash of the members to use as the group name.
+			sort.Strings(memberNames)
+			hash := sha1.Sum([]byte(strings.Join(memberNames, ",")))
+			dbgroupName := fmt.Sprintf("sg_%s_%x", sync.Name, hash[:4]) // e.g., sg_mysync_a1b2c3d4
+
+			// Unconditionally recreate the group to ensure it's correct.
+			runBucardoCommand("del", "dbgroup", dbgroupName)
+			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbStrings...)...)
+			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 		}
 
 		// Tables/herds can only be set on 'add', not 'update'.
