@@ -75,7 +75,7 @@ func runCommand(logCmd, name string, arg ...string) error {
 	if logCmd == "" {
 		logCmd = cmd.String()
 	}
-	logger.Info("Running command", "command", logCmd)
+	logger.Info("Running command", "component", "command_runner", "command", logCmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -90,7 +90,7 @@ func runBucardoCommand(args ...string) error {
 
 // startPostgres starts the PostgreSQL service and waits for Bucardo to be ready.
 func startPostgres() {
-	logger.Info("Starting PostgreSQL...")
+	logger.Info("Starting PostgreSQL service", "component", "startup")
 	if err := runCommand("", "service", "postgresql", "start"); err != nil {
 		logger.Error("Failed to start postgresql service", "error", err)
 		os.Exit(1)
@@ -103,7 +103,7 @@ func startPostgres() {
 	for time.Now().Before(deadline) {
 		// We check the output of `bucardo status` to see if it's ready.
 		cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo status")
-		if err := cmd.Run(); err == nil {
+		if err := cmd.Run(); err == nil { // We only care about the exit code here.
 			logger.Info("Bucardo is ready.")
 			return
 		}
@@ -286,18 +286,20 @@ func listBucardoDbs() ([]string, error) {
 
 // addDatabasesToBucardo iterates through the config and adds each database to Bucardo's configuration.
 func addDatabasesToBucardo(config *BucardoConfig) {
-	logger.Info("Adding/updating databases in Bucardo...")
+	appLogger := logger.With("component", "db_reconciler")
+	appLogger.Info("Starting database reconciliation")
 
 	for _, db := range config.Databases {
 		dbName := fmt.Sprintf("db%d", db.ID)
+		dbLogger := appLogger.With("db_name", dbName, "db_id", db.ID, "db_host", db.Host)
 		exists := databaseExists(dbName)
 		command := "add"
 
 		if exists {
 			command = "update"
-			logger.Info("Updating existing db", "name", dbName, "id", db.ID, "host", db.Host)
+			dbLogger.Info("Database exists, preparing update")
 		} else {
-			logger.Info("Adding new db", "name", dbName, "id", db.ID, "host", db.Host)
+			dbLogger.Info("Database not found, preparing to add")
 		}
 
 		_, err := getDbPassword(db)
@@ -317,7 +319,7 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			args = append(args, fmt.Sprintf("port=%d", *db.Port))
 		}
 		if err := runBucardoCommand(args...); err != nil {
-			logger.Error("Failed to modify database", "action", command, "name", dbName, "error", err)
+			dbLogger.Error("Failed to modify database", "action", command, "error", err)
 			os.Exit(1)
 		}
 	}
@@ -369,15 +371,18 @@ func listBucardoSyncs() ([]string, error) {
 
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
-	logger.Info("Adding syncs to Bucardo...")
+	appLogger := logger.With("component", "sync_reconciler")
+	appLogger.Info("Starting sync reconciliation")
+
 	for _, sync := range config.Syncs {
+		syncLogger := appLogger.With("sync_name", sync.Name)
 		exists := syncExists(sync.Name)
 		command := "add"
 		if exists {
 			command = "update"
-			logger.Info("Updating existing sync", "name", sync.Name)
+			syncLogger.Info("Sync exists, preparing update")
 		} else {
-			logger.Info("Adding new sync", "name", sync.Name)
+			syncLogger.Info("Sync not found, preparing to add")
 		}
 
 		args := []string{command, "sync", sync.Name}
@@ -388,7 +393,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 		}
 
 		if len(sync.Bidirectional) > 0 {
-			logger.Info("Configuring bidirectional sync", "dbs", sync.Bidirectional)
+			syncLogger.Info("Configuring as bidirectional sync", "dbs", sync.Bidirectional)
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
 			if command == "add" {
 				dbgroupMembers := make([]string, len(sync.Bidirectional))
@@ -411,6 +416,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 			}
 		} else if len(sync.Sources) > 0 || len(sync.Targets) > 0 {
+			syncLogger.Info("Configuring as source-to-target sync")
 			// For source-to-target syncs, we create a dbgroup with a deterministic name
 			// based on its members to ensure it's only recreated if the members change.
 			var dbStrings []string
@@ -438,17 +444,17 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		// Tables/herds can only be set on 'add', not 'update'.
 		if command == "add" && sync.Herd != "" {
-			logger.Info("Using herd", "name", sync.Herd)
+			syncLogger.Info("Configuring with herd", "herd_name", sync.Herd)
 			sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
 			runBucardoCommand("del", "herd", sync.Herd, "--force")
 			runBucardoCommand("add", "herd", sync.Herd)
 			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 			args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
 		} else if command == "add" && sync.Tables != "" {
-			logger.Info("Using table list")
+			syncLogger.Info("Configuring with table list")
 			args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
 		} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
-			logger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
+			syncLogger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.")
 		}
 
 		// Add optional parameters to the command.
@@ -465,7 +471,7 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 		// Execute the final bucardo command.
 		if err := runBucardoCommand(args...); err != nil {
-			logger.Error("Failed to modify sync", "action", command, "name", sync.Name, "error", err)
+			syncLogger.Error("Failed to modify sync", "action", command, "error", err)
 			os.Exit(1)
 		}
 	}
@@ -493,7 +499,7 @@ func streamBucardoLog() *exec.Cmd {
 
 // startBucardo starts the main Bucardo process.
 func startBucardo() {
-	logger.Info("Starting Bucardo...")
+	logger.Info("Starting main Bucardo service", "component", "bucardo_service")
 	logger.Info("Checking for and stopping any stale Bucardo processes...")
 	stopBucardo() // Use our robust stop function.
 
@@ -505,7 +511,7 @@ func startBucardo() {
 
 // stopBucardo gracefully stops the Bucardo service and waits for confirmation.
 func stopBucardo() {
-	logger.Info("Stopping Bucardo...")
+	logger.Info("Stopping main Bucardo service", "component", "bucardo_service")
 	if err := runBucardoCommand("stop"); err != nil {
 		logger.Warn("'bucardo stop' command failed", "error", err)
 	}
@@ -532,7 +538,7 @@ func monitorBucardo() {
 	tailCmd := streamBucardoLog()
 	if tailCmd != nil && tailCmd.Process != nil {
 		defer func() {
-			logger.Info("Stopping log streamer...")
+			logger.Info("Stopping log streamer", "component", "log_streamer")
 			// Kill the process group to ensure tail and any children are stopped.
 			syscall.Kill(-tailCmd.Process.Pid, syscall.SIGKILL)
 		}()
@@ -544,7 +550,7 @@ func monitorBucardo() {
 	for {
 		select {
 		case sig := <-sigs:
-			logger.Info("Received signal, shutting down.", "signal", sig)
+			logger.Info("Received signal, shutting down gracefully", "component", "shutdown", "signal", sig)
 			stopBucardo()
 			return
 		}
@@ -560,7 +566,8 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	}
 
 	if len(runOnceSyncs) > 0 {
-		logger.Info("Monitoring sync(s) for completion", "count", len(runOnceSyncs), "syncs", getMapKeys(runOnceSyncs))
+		appLogger := logger.With("component", "run_once_monitor")
+		appLogger.Info("Monitoring sync(s) for completion", "count", len(runOnceSyncs), "syncs", getMapKeys(runOnceSyncs))
 	}
 
 	allSyncsAreRunOnce := len(config.Syncs) == len(runOnceSyncs)
@@ -583,7 +590,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
-		logger.Error("Could not start log tailing command", "error", err)
+		logger.Error("Could not start log tailing command for run-once monitor", "error", err)
 		os.Exit(1)
 	}
 	if maxTimeout != nil && *maxTimeout > 0 {
@@ -608,7 +615,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	for {
 		select {
 		case line, ok := <-lineChan:
-			if !ok {
+			if !ok { // Channel closed
 				logger.Info("Log streaming finished unexpectedly.")
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				cmd.Wait()
@@ -619,12 +626,13 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 			// Check for the completion message from the logs, e.g., "KID (sync0) Kid ... exiting at cleanup_kid.  Reason: Normal exit"
 			if strings.Contains(line, "Reason: Normal exit") {
 				for syncName := range runOnceSyncs {
-					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) {
-						logger.Info("Completion message for sync detected", "sync", syncName)
+					syncLogger := logger.With("component", "run_once_monitor", "sync_name", syncName)
+					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) { // Match the log line to the sync
+						syncLogger.Info("Completion message for sync detected")
 						if err := runBucardoCommand("stop", syncName); err != nil {
-							logger.Warn("Failed to stop sync", "name", syncName, "error", err)
+							syncLogger.Warn("Failed to stop sync after completion", "error", err)
 						}
-						// Remove from the map of syncs we are waiting for.
+						// Remove from the map of syncs we are waiting for
 						delete(runOnceSyncs, syncName)
 						logger.Info("Run-once sync(s) remaining", "count", len(runOnceSyncs))
 					}
@@ -633,13 +641,13 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 
 			if len(runOnceSyncs) == 0 {
 				logger.Info("All monitored syncs have completed.")
-				if allSyncsAreRunOnce {
+				if allSyncsAreRunOnce { // If all syncs were run-once, we can exit.
 					logger.Info("All configured syncs were run-once. Shutting down container.")
 					cancel()                                        // Stop the scanner goroutine.
 					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group.
 					stopBucardo()
 					return // Success.
-				} else {
+				} else { // Otherwise, hand off to the standard long-running monitor.
 					logger.Info("Other syncs are still running. Switching to standard monitoring mode.")
 					cancel()
 					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -659,7 +667,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 // setLogLevel sets the global Bucardo logging level if specified in the config.
 func setLogLevel(config *BucardoConfig) {
 	if config.LogLevel != "" {
-		logger.Info("Setting Bucardo log level", "level", config.LogLevel)
+		logger.Info("Setting Bucardo global log level", "component", "config", "level", config.LogLevel)
 		if err := runBucardoCommand("set", fmt.Sprintf("log_level=%s", config.LogLevel)); err != nil {
 			logger.Warn("Failed to set log_level", "error", err)
 		}
@@ -695,7 +703,8 @@ func setupAllPgpass(config *BucardoConfig) {
 // removeOrphanedDbs compares the databases in the config with those in Bucardo
 // and removes any databases from Bucardo that are not declared in the config.
 func removeOrphanedDbs(config *BucardoConfig) {
-	logger.Info("Checking for orphaned databases to remove...")
+	appLogger := logger.With("component", "cleanup")
+	appLogger.Info("Checking for orphaned databases to remove")
 
 	// 1. Get all database names declared in the config file (e.g., "db1", "db2").
 	configDbs := make(map[string]bool)
@@ -707,14 +716,14 @@ func removeOrphanedDbs(config *BucardoConfig) {
 	// 2. Get all database names currently existing in Bucardo.
 	bucardoDbs, err := listBucardoDbs()
 	if err != nil {
-		logger.Error("Could not list existing Bucardo databases for cleanup", "error", err)
+		appLogger.Error("Could not list existing Bucardo databases for cleanup", "error", err)
 		return // Skip cleanup if we can't get the list.
 	}
 
 	// 3. Compare and delete any database from Bucardo that is not in the config.
 	for _, bucardoDbName := range bucardoDbs {
 		if !configDbs[bucardoDbName] {
-			logger.Info("Removing orphaned database not found in configuration", "name", bucardoDbName)
+			appLogger.Info("Removing orphaned database not found in configuration", "db_name", bucardoDbName)
 			runBucardoCommand("del", "db", bucardoDbName)
 		}
 	}
@@ -723,7 +732,8 @@ func removeOrphanedDbs(config *BucardoConfig) {
 // removeOrphanedSyncs compares the syncs in the config with those in Bucardo
 // and removes any syncs from Bucardo that are not declared in the config.
 func removeOrphanedSyncs(config *BucardoConfig) {
-	logger.Info("Checking for orphaned syncs to remove...")
+	appLogger := logger.With("component", "cleanup")
+	appLogger.Info("Checking for orphaned syncs to remove")
 
 	// 1. Get all sync names declared in the config file.
 	configSyncs := make(map[string]bool)
@@ -734,14 +744,14 @@ func removeOrphanedSyncs(config *BucardoConfig) {
 	// 2. Get all sync names currently existing in Bucardo.
 	bucardoSyncs, err := listBucardoSyncs()
 	if err != nil {
-		logger.Error("Could not list existing Bucardo syncs for cleanup", "error", err)
+		appLogger.Error("Could not list existing Bucardo syncs for cleanup", "error", err)
 		return // Skip cleanup if we can't get the list.
 	}
 
 	// 3. Compare and delete any sync from Bucardo that is not in the config.
 	for _, bucardoSyncName := range bucardoSyncs {
 		if !configSyncs[bucardoSyncName] {
-			logger.Info("Removing orphaned sync not found in configuration", "name", bucardoSyncName)
+			appLogger.Info("Removing orphaned sync not found in configuration", "sync_name", bucardoSyncName)
 			runBucardoCommand("del", "sync", bucardoSyncName)
 		}
 	}
