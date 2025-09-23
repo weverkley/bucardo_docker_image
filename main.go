@@ -369,7 +369,7 @@ func listBucardoSyncs() ([]string, error) {
 func getSyncDbgroup(syncName string) (string, error) {
 	// This regex finds the "DB group" label and captures the quoted group name that follows.
 	// e.g., from '... DB group "my_group" ...' it captures 'my_group'.
-	re := regexp.MustCompile(`DB group "([^"]+)"`)
+	re := regexp.MustCompile(`(?:DB group "([^"]+)"|dbs: (\S+))`)
 
 	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list sync %s", syncName))
 	output, err := cmd.CombinedOutput()
@@ -381,12 +381,41 @@ func getSyncDbgroup(syncName string) (string, error) {
 
 	matches := re.FindStringSubmatch(outputStr)
 	if len(matches) > 1 {
-		return matches[1], nil // The first capture group is the dbgroup name.
+		// The regex has two capture groups. The first non-empty one is our match.
+		if matches[1] != "" {
+			return matches[1], nil // Matched 'DB group "..."'
+		}
+		return matches[2], nil // Matched 'dbs: ...'
 	}
 
 	// If parsing fails, log the output for debugging.
 	logger.Debug("Bucardo output for 'list sync'", "sync", syncName, "output", outputStr)
 	return "", fmt.Errorf("could not find 'DB group \"<name>\"' pattern in output for sync '%s'", syncName)
+}
+
+// getDbgroupMembers parses the output of `bucardo list dbgroup <name>` to get the database names.
+func getDbgroupMembers(dbgroupName string) ([]string, error) {
+	re := regexp.MustCompile(`db (\S+):`) // Captures the db name, e.g., "db3" from "db db3: source"
+
+	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list dbgroup %s", dbgroupName))
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		// If the group doesn't exist, it's not an error in this context; it just means there are no members.
+		if strings.Contains(outputStr, "No such dbgroup") {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to execute 'bucardo list dbgroup %s': %w. Output: %s", dbgroupName, err, outputStr)
+	}
+
+	matches := re.FindAllStringSubmatch(outputStr, -1)
+	var members []string
+	for _, match := range matches {
+		members = append(members, match[1])
+	}
+
+	return members, nil
 }
 
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
@@ -402,20 +431,17 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			logger.Info("Adding new sync", "name", sync.Name)
 		}
 
-		args := []string{
-			command, "sync", sync.Name,
-			fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy),
+		args := []string{command, "sync", sync.Name}
+
+		// Onetimecopy should only be set on creation, not on every update.
+		if command == "add" {
+			args = append(args, fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy))
 		}
 
 		if len(sync.Bidirectional) > 0 {
-			// Handle bidirectional (multi-master) sync.
 			logger.Info("Configuring bidirectional sync", "dbs", sync.Bidirectional)
-
-			// Create a dbgroup for the bidirectional sync.
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
-
 			if command == "add" {
-				// On 'add', we can safely create the dbgroup directly.
 				dbgroupMembers := make([]string, len(sync.Bidirectional))
 				for i, dbID := range sync.Bidirectional {
 					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
@@ -423,90 +449,45 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
 				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 			} else { // command == "update"
-				// Use the "swap and replace" method to update a dbgroup without deleting the sync.
-				tempDbgroupName := fmt.Sprintf("bg_%s_%d", sync.Name, time.Now().Unix())
-				logger.Info("Creating temporary dbgroup for sync update", "name", tempDbgroupName)
-
+				// To ensure idempotency, we always recreate the dbgroup with a predictable name.
+				// First, delete the old one. We don't use --force, so this is safe.
+				// It will fail if a sync is using it, but that's okay because we are about to re-assign it.
+				// It will succeed if the group is orphaned or doesn't exist.
+				runBucardoCommand("del", "dbgroup", dbgroupName)
 				dbgroupMembers := make([]string, len(sync.Bidirectional))
 				for i, dbID := range sync.Bidirectional {
 					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
 				}
-				runBucardoCommand(append([]string{"add", "dbgroup", tempDbgroupName}, dbgroupMembers...)...)
-				args = append(args, fmt.Sprintf("dbs=%s", tempDbgroupName))
-
-				// Defer cleanup of the old dbgroup after the sync has been updated.
-				defer func(oldGroup string) {
-					logger.Info("Cleaning up old dbgroup", "name", oldGroup)
-					runBucardoCommand("del", "dbgroup", oldGroup, "--force")
-				}(dbgroupName)
+				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
+				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 			}
-
-			// Tables/herds can only be set on 'add', not 'update'.
-			if command == "add" && sync.Tables != "" {
-				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
-			} else if command == "update" && sync.Tables != "" {
-				logger.Warn("The 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
+		} else if len(sync.Sources) > 0 || len(sync.Targets) > 0 {
+			// For source-target syncs, Bucardo creates an implicit dbgroup.
+			// We just need to provide the list of dbs on add or update.
+			var dbStrings []string
+			for _, sourceID := range sync.Sources {
+				dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
 			}
-
-		} else if len(sync.Sources) > 0 && len(sync.Targets) > 0 {
-			// Handle standard source -> target sync
-			if command == "add" { // For 'add', we can pass the list of dbs directly.
-				var dbStrings []string
-				for _, sourceID := range sync.Sources {
-					dbStrings = append(dbStrings, fmt.Sprintf("db%d:source", sourceID))
-				}
-				for _, targetID := range sync.Targets {
-					dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
-				}
-				dbsArg := strings.Join(dbStrings, ",")
-				args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
-			} else { // command == "update"
-				// Use the "swap and replace" method to update a dbgroup without data loss.
-				oldDbgroupName, err := getSyncDbgroup(sync.Name)
-				if err != nil {
-					logger.Error("Failed to determine current dbgroup for sync", "name", sync.Name, "error", err)
-					os.Exit(1)
-				}
-
-				// 1. Create a new, temporary dbgroup with the correct members.
-				tempDbgroupName := fmt.Sprintf("sg_%s_%d", sync.Name, time.Now().Unix())
-				logger.Info("Creating temporary dbgroup for sync update", "name", tempDbgroupName)
-				var dbgroupArgs []string
-				for _, sourceID := range sync.Sources {
-					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:source", sourceID))
-				}
-				for _, targetID := range sync.Targets {
-					dbgroupArgs = append(dbgroupArgs, fmt.Sprintf("db%d:target", targetID))
-				}
-				runBucardoCommand(append([]string{"add", "dbgroup", tempDbgroupName}, dbgroupArgs...)...)
-
-				args = append(args, fmt.Sprintf("dbs=%s", tempDbgroupName))
-
-				defer func(groupToDelete string) { // Schedule cleanup of the old dbgroup.
-					// This check is important. If the old group was the same as the new one (unlikely but possible), don't delete it.
-					if groupToDelete != tempDbgroupName {
-						logger.Info("Cleaning up old dbgroup", "name", groupToDelete)
-						if err := runBucardoCommand("del", "dbgroup", groupToDelete, "--force"); err != nil {
-							logger.Warn("Failed to clean up old dbgroup", "name", groupToDelete, "error", err)
-						}
-					}
-				}(oldDbgroupName)
+			for _, targetID := range sync.Targets {
+				dbStrings = append(dbStrings, fmt.Sprintf("db%d:target", targetID))
 			}
+			dbsArg := strings.Join(dbStrings, ",")
+			args = append(args, fmt.Sprintf("dbs=%s", dbsArg))
+		}
 
-			// Tables/herds can only be set on 'add', not 'update'.
-			if command == "add" && sync.Herd != "" {
-				logger.Info("Using herd", "name", sync.Herd)
-				sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
-				runBucardoCommand("del", "herd", sync.Herd, "--force")
-				runBucardoCommand("add", "herd", sync.Herd)
-				runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
-				args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
-			} else if command == "add" && sync.Tables != "" {
-				logger.Info("Using table list")
-				args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
-			} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
-				logger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
-			}
+		// Tables/herds can only be set on 'add', not 'update'.
+		if command == "add" && sync.Herd != "" {
+			logger.Info("Using herd", "name", sync.Herd)
+			sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
+			runBucardoCommand("del", "herd", sync.Herd, "--force")
+			runBucardoCommand("add", "herd", sync.Herd)
+			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
+			args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
+		} else if command == "add" && sync.Tables != "" {
+			logger.Info("Using table list")
+			args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
+		} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
+			logger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.", "sync", sync.Name)
 		}
 
 		// Add optional parameters to the command.
@@ -527,6 +508,20 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			os.Exit(1)
 		}
 	}
+}
+
+// slicesEqual checks if two string slices contain the same elements, regardless of order.
+// It assumes the slices are already sorted.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // streamBucardoLog starts a `tail -F` command to stream the Bucardo log file,
