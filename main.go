@@ -165,6 +165,10 @@ func validateConfig(config *BucardoConfig) []error {
 					errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' database ID %d is not defined in the 'databases' list", sync.Name, id))
 				}
 			}
+			// Bucardo source/target strategies are invalid for multi-master syncs.
+			if sync.ConflictStrategy == "bucardo_source" || sync.ConflictStrategy == "bucardo_target" {
+				errors = append(errors, fmt.Errorf("sync '%s': invalid conflict_strategy '%s' for a bidirectional sync. Use 'bucardo_latest' instead", sync.Name, sync.ConflictStrategy))
+			}
 		} else { // Standard source/target sync
 			if len(sync.Sources) == 0 {
 				errors = append(errors, fmt.Errorf("sync '%s': must have at least one source", sync.Name))
@@ -409,16 +413,33 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 			// Create a dbgroup for the bidirectional sync.
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
-			// Always ensure the dbgroup is up-to-date.
-			logger.Info("Re-creating dbgroup to ensure it matches configuration", "name", dbgroupName)
-			runBucardoCommand("del", "dbgroup", dbgroupName, "--force")
-			dbgroupMembers := make([]string, len(sync.Bidirectional))
-			for i, dbID := range sync.Bidirectional {
-				dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
-			}
-			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
 
-			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
+			if command == "add" {
+				// On 'add', we can safely create the dbgroup directly.
+				dbgroupMembers := make([]string, len(sync.Bidirectional))
+				for i, dbID := range sync.Bidirectional {
+					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
+				}
+				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
+				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
+			} else { // command == "update"
+				// Use the "swap and replace" method to update a dbgroup without deleting the sync.
+				tempDbgroupName := fmt.Sprintf("bg_%s_%d", sync.Name, time.Now().Unix())
+				logger.Info("Creating temporary dbgroup for sync update", "name", tempDbgroupName)
+
+				dbgroupMembers := make([]string, len(sync.Bidirectional))
+				for i, dbID := range sync.Bidirectional {
+					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
+				}
+				runBucardoCommand(append([]string{"add", "dbgroup", tempDbgroupName}, dbgroupMembers...)...)
+				args = append(args, fmt.Sprintf("dbs=%s", tempDbgroupName))
+
+				// Defer cleanup of the old dbgroup after the sync has been updated.
+				defer func(oldGroup string) {
+					logger.Info("Cleaning up old dbgroup", "name", oldGroup)
+					runBucardoCommand("del", "dbgroup", oldGroup, "--force")
+				}(dbgroupName)
+			}
 
 			// Tables/herds can only be set on 'add', not 'update'.
 			if command == "add" && sync.Tables != "" {
