@@ -367,59 +367,6 @@ func listBucardoSyncs() ([]string, error) {
 	return syncs, nil
 }
 
-// getSyncDbgroup finds the name of the dbgroup currently associated with a sync by parsing command output.
-func getSyncDbgroup(syncName string) (string, error) {
-	// This regex finds the "DB group" label and captures the quoted group name that follows.
-	// e.g., from '... DB group "my_group" ...' it captures 'my_group'.
-	re := regexp.MustCompile(`(?:DB group "([^"]+)"|dbs: (\S+))`)
-
-	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list sync %s", syncName))
-	output, err := cmd.CombinedOutput()
-	outputStr := string(output)
-
-	if err != nil {
-		return "", fmt.Errorf("failed to execute 'bucardo list sync %s': %w. Output: %s", syncName, err, outputStr)
-	}
-
-	matches := re.FindStringSubmatch(outputStr)
-	if len(matches) > 1 {
-		// The regex has two capture groups. The first non-empty one is our match.
-		if matches[1] != "" {
-			return matches[1], nil // Matched 'DB group "..."'
-		}
-		return matches[2], nil // Matched 'dbs: ...'
-	}
-
-	// If parsing fails, log the output for debugging.
-	logger.Debug("Bucardo output for 'list sync'", "sync", syncName, "output", outputStr)
-	return "", fmt.Errorf("could not find 'DB group \"<name>\"' pattern in output for sync '%s'", syncName)
-}
-
-// getDbgroupMembers parses the output of `bucardo list dbgroup <name>` to get the database names.
-func getDbgroupMembers(dbgroupName string) ([]string, error) {
-	re := regexp.MustCompile(`db (\S+):`) // Captures the db name, e.g., "db3" from "db db3: source"
-
-	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list dbgroup %s", dbgroupName))
-	output, err := cmd.CombinedOutput()
-	outputStr := string(output)
-
-	if err != nil {
-		// If the group doesn't exist, it's not an error in this context; it just means there are no members.
-		if strings.Contains(outputStr, "No such dbgroup") {
-			return []string{}, nil
-		}
-		return nil, fmt.Errorf("failed to execute 'bucardo list dbgroup %s': %w. Output: %s", dbgroupName, err, outputStr)
-	}
-
-	matches := re.FindAllStringSubmatch(outputStr, -1)
-	var members []string
-	for _, match := range matches {
-		members = append(members, match[1])
-	}
-
-	return members, nil
-}
-
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
 	logger.Info("Adding syncs to Bucardo...")
@@ -522,20 +469,6 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			os.Exit(1)
 		}
 	}
-}
-
-// slicesEqual checks if two string slices contain the same elements, regardless of order.
-// It assumes the slices are already sorted.
-func slicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // streamBucardoLog starts a `tail -F` command to stream the Bucardo log file,
