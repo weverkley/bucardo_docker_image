@@ -825,7 +825,22 @@ func removeOrphanedSyncs(config *BucardoConfig) {
 	for _, bucardoSyncName := range bucardoSyncs {
 		if !configSyncs[bucardoSyncName] {
 			appLogger.Info("Removing orphaned sync not found in configuration", "sync_name", bucardoSyncName)
+
+			// To perform a clean removal, we must also delete the associated relgroup.
+			// First, get the sync details to find the relgroup name.
+			exists, syncDetailsOutput := syncExists(bucardoSyncName)
+			if !exists {
+				continue // Sync disappeared, nothing to do.
+			}
+
+			relgroupName, err := getSyncRelgroup(syncDetailsOutput)
+			if err != nil {
+				// If we can't find the relgroup, it might not have one. Fallback to assuming the name is the same.
+				relgroupName = bucardoSyncName
+			}
+
 			runBucardoCommand("del", "sync", bucardoSyncName)
+			runBucardoCommand("del", "relgroup", relgroupName)
 		}
 	}
 }
