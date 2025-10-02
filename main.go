@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -76,9 +75,27 @@ func runCommand(logCmd, name string, arg ...string) error {
 		logCmd = cmd.String()
 	}
 	logger.Info("Running command", "component", "command_runner", "command", logCmd)
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to get stderr pipe: %w", err)
+	}
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// Filter out harmless "No such..." messages from stderr to reduce log noise.
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "No such dbgroup:") && !strings.HasPrefix(line, "No such sync:") {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}
+
+	return cmd.Wait()
 }
 
 // runBucardoCommand executes a `bucardo` command as the configured bucardoUser.
@@ -101,9 +118,8 @@ func startPostgres() {
 	deadline := time.Now().Add(readinessTimeout)
 
 	for time.Now().Before(deadline) {
-		// We check the output of `bucardo status` to see if it's ready.
 		cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo status")
-		if err := cmd.Run(); err == nil { // We only care about the exit code here.
+		if err := cmd.Run(); err == nil {
 			logger.Info("Bucardo is ready.")
 			return
 		}
@@ -167,7 +183,7 @@ func validateConfig(config *BucardoConfig) []error {
 					errors = append(errors, fmt.Errorf("sync '%s': 'bidirectional' database ID %d is not defined in the 'databases' list", sync.Name, id))
 				}
 			}
-			// Bucardo source/target strategies are invalid for multi-master syncs.
+			// Source/target conflict strategies are invalid for multi-master syncs.
 			if sync.ConflictStrategy == "bucardo_source" || sync.ConflictStrategy == "bucardo_target" {
 				errors = append(errors, fmt.Errorf("sync '%s': invalid conflict_strategy '%s' for a bidirectional sync. Use 'bucardo_latest' instead", sync.Name, sync.ConflictStrategy))
 			}
@@ -221,8 +237,7 @@ func getDbPassword(db Database) (string, error) {
 // setupPgpassFile appends a new entry to the .pgpass file. This is the most
 // robust way to handle passwords with special characters for libpq.
 func setupPgpassFile(db Database, password string) error {
-	// Format: hostname:port:database:username:password
-	// Use '*' for port/database to match any.
+	// Format: hostname:port:database:username:password. Use '*' for port/database to match any.
 	port := "*"
 	if db.Port != nil {
 		port = fmt.Sprintf("%d", *db.Port)
@@ -239,22 +254,24 @@ func setupPgpassFile(db Database, password string) error {
 		return fmt.Errorf("failed to write to .pgpass file: %w", err)
 	}
 
-	// Ensure the file is owned by the bucardoUser.
 	return runCommand("", "chown", fmt.Sprintf("%s:%s", bucardoUser, bucardoUser), pgpassPath)
 }
 
 // databaseExists checks if a Bucardo database with the given name already exists.
 func databaseExists(dbName string) bool {
-	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list dbs")
-	output, err := cmd.Output()
+	// The most reliable way to check for existence is to list all dbs and parse the output.
+	// `bucardo list dbs <name>` can have ambiguous exit codes.
+	allDbs, err := listBucardoDbs()
 	if err != nil {
-		log.Printf("[WARNING] Could not list Bucardo databases to check for existence: %v", err)
+		logger.Warn("Could not list Bucardo databases to check for existence", "error", err)
 		return false
 	}
-
-	// The output format is "Database: <name> ...".
-	searchString := fmt.Sprintf("Database: %s", dbName)
-	return strings.Contains(string(output), searchString)
+	for _, bdb := range allDbs {
+		if bdb == dbName {
+			return true
+		}
+	}
+	return false
 }
 
 // listBucardoDbs returns a slice of all database names currently configured in Bucardo.
@@ -274,7 +291,7 @@ func listBucardoDbs() ([]string, error) {
 
 	matches := re.FindAllStringSubmatch(outputStr, -1)
 	if matches == nil {
-		return []string{}, nil // No databases found
+		return []string{}, nil
 	}
 
 	var dbs []string
@@ -308,9 +325,8 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 			os.Exit(1)
 		}
 
-		// Build the arguments for bucardo; the password will be picked up from .pgpass.
 		args := []string{
-			command, "db", dbName,
+			command, "dbs", dbName,
 			fmt.Sprintf("dbname=%s", db.DBName),
 			fmt.Sprintf("host=%s", db.Host),
 			fmt.Sprintf("user=%s", db.User),
@@ -326,20 +342,19 @@ func addDatabasesToBucardo(config *BucardoConfig) {
 }
 
 // syncExists checks if a Bucardo sync with the given name already exists.
-func syncExists(syncName string) bool {
-	// The `bucardo list sync <name>` command has an unreliable exit code (always 0).
-	// A more reliable method is to list all syncs and check if the name is present.
-	cmd := exec.Command("su", "-", bucardoUser, "-c", "bucardo list syncs")
-	output, err := cmd.Output()
-	if err != nil {
-		// If the command itself fails, we can't determine existence. Log and assume it doesn't exist.
-		logger.Warn("Could not list Bucardo syncs to check for existence", "error", err)
-		return false
-	}
+// It returns a boolean for existence and the command's output on success for parsing.
+func syncExists(syncName string) (exists bool, stdout []byte) {
+	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list sync %s", syncName))
+	// We must separate stdout and stderr. Warnings on stderr can break parsing,
+	// but the command can still succeed (exit 0).
+	var outb, errb strings.Builder
+	cmd.Stdout = &outb
+	cmd.Stderr = &errb
+	err := cmd.Run()
 
-	// The output format is 'Sync "<name>" ...'. Using quotes prevents partial matches.
-	searchString := fmt.Sprintf("Sync \"%s\"", syncName)
-	return strings.Contains(string(output), searchString)
+	// The sync exists only if the command succeeded AND produced output, as `list syncs <name>` can exit 0 even if not found.
+	stdoutString := outb.String()
+	return err == nil && stdoutString != "", []byte(stdoutString)
 }
 
 // listBucardoSyncs returns a slice of all sync names currently configured in Bucardo.
@@ -359,7 +374,7 @@ func listBucardoSyncs() ([]string, error) {
 
 	matches := re.FindAllStringSubmatch(outputStr, -1)
 	if matches == nil {
-		return []string{}, nil // No syncs found
+		return []string{}, nil
 	}
 
 	var syncs []string
@@ -369,6 +384,53 @@ func listBucardoSyncs() ([]string, error) {
 	return syncs, nil
 }
 
+// getSyncRelgroup parses the output of `bucardo list sync` to find the relgroup name.
+func getSyncRelgroup(syncDetailsOutput []byte) (string, error) {
+	re := regexp.MustCompile(`Relgroup: (\S+)`)
+	matches := re.FindStringSubmatch(string(syncDetailsOutput))
+	if len(matches) < 2 {
+		return "", fmt.Errorf("could not find relgroup in sync details")
+	}
+	return matches[1], nil
+}
+
+// getSyncTables fetches the list of tables for a given relgroup from Bucardo.
+func getSyncTables(relgroupName string) ([]string, error) {
+	if relgroupName == "" {
+		return []string{}, nil
+	}
+	cmd := exec.Command("su", "-", bucardoUser, "-c", fmt.Sprintf("bucardo list relgroup %s --verbose", relgroupName))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list relgroup %s: %w. Output: %s", relgroupName, err, string(output))
+	}
+
+	// The output lists tables one per line, indented. e.g., "  public.users"
+	re := regexp.MustCompile(`\s+(\S+\.\S+)`)
+	matches := re.FindAllStringSubmatch(string(output), -1)
+
+	if len(matches) == 0 {
+		// This can happen if the relgroup is empty or doesn't exist.
+		return []string{}, nil
+	}
+
+	var tables []string
+	for _, match := range matches {
+		// The regex ensures we have at least one submatch.
+		tableName := match[1]
+		// The output may include "(sequence)" or a trailing comma, which must be stripped.
+		tableName = strings.TrimRight(tableName, ",")
+		tableName = strings.TrimSpace(strings.Split(tableName, "(")[0])
+		if tableName != "" {
+			tables = append(tables, tableName)
+		}
+	}
+
+	// Sort for consistent string comparison.
+	sort.Strings(tables)
+	return tables, nil
+}
+
 // addSyncsToBucardo configures the replication tasks (syncs) in Bucardo based on the JSON config.
 func addSyncsToBucardo(config *BucardoConfig) {
 	appLogger := logger.With("component", "sync_reconciler")
@@ -376,49 +438,72 @@ func addSyncsToBucardo(config *BucardoConfig) {
 
 	for _, sync := range config.Syncs {
 		syncLogger := appLogger.With("sync_name", sync.Name)
-		exists := syncExists(sync.Name)
-		command := "add"
+		exists, syncDetailsOutput := syncExists(sync.Name)
+
 		if exists {
-			command = "update"
-			syncLogger.Info("Sync exists, preparing update")
-		} else {
-			syncLogger.Info("Sync not found, preparing to add")
+			// Logic for existing syncs: Check for table changes before deciding to update or recreate.
+			if sync.Tables != "" {
+				// We must get the relgroup name from the sync details, as it can be different from the sync name.
+				relgroupName, err := getSyncRelgroup(syncDetailsOutput)
+				if err != nil {
+					// This can happen if the sync is inactive. As a fallback, assume the relgroup name matches the sync name.
+					syncLogger.Debug("Could not parse relgroup from sync details, falling back to sync name.", "error", err)
+					relgroupName = sync.Name
+				}
+
+				currentTables, err := getSyncTables(relgroupName)
+				if err != nil {
+					// If we can't get the tables, it's safer to assume no change and proceed with a safe update.
+					syncLogger.Warn("Could not get tables for relgroup, cannot compare. Assuming no change.", "relgroup", relgroupName, "error", err)
+				}
+
+				configTablesRaw := strings.Split(sync.Tables, ",")
+				configTables := make([]string, 0, len(configTablesRaw))
+				for _, t := range configTablesRaw {
+					configTables = append(configTables, strings.TrimSpace(t))
+				}
+				sort.Strings(configTables)
+
+				if strings.Join(currentTables, ",") != strings.Join(configTables, ",") {
+					syncLogger.Warn("Table list for sync has changed. This requires a destructive re-creation.", "current_tables", currentTables, "new_tables", configTables)
+					syncLogger.Warn("WARNING: Any pending changes for this sync that have not been replicated will be lost.")
+					syncLogger.Info("Re-creating sync to apply new table configuration.")
+					// The sync must be deleted before the relgroup to avoid foreign key violations.
+					runBucardoCommand("del", "sync", sync.Name)
+					// Now it's safe to delete the orphaned relgroup to prevent Bucardo from creating a `_2` suffixed one.
+					runBucardoCommand("del", "relgroup", relgroupName)
+					// Fall through to the 'add' logic.
+				} else {
+					syncLogger.Info("Sync exists and tables are unchanged. Applying non-destructive update.")
+					updateArgs := []string{"update", "sync", sync.Name}
+					if sync.StrictChecking != nil {
+						updateArgs = append(updateArgs, fmt.Sprintf("strict_checking=%t", *sync.StrictChecking))
+					}
+					if sync.ConflictStrategy != "" {
+						updateArgs = append(updateArgs, fmt.Sprintf("conflict_strategy=%s", sync.ConflictStrategy))
+					}
+					runBucardoCommand(updateArgs...)
+					continue
+				}
+			}
 		}
 
-		args := []string{command, "sync", sync.Name}
-
-		// Onetimecopy should only be set on creation, not on every update.
-		if command == "add" {
-			args = append(args, fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy))
-		}
+		syncLogger.Info("Preparing to add sync.")
+		command := "add"
+		args := []string{command, "sync", sync.Name, fmt.Sprintf("onetimecopy=%d", sync.Onetimecopy)}
 
 		if len(sync.Bidirectional) > 0 {
 			syncLogger.Info("Configuring as bidirectional sync", "dbs", sync.Bidirectional)
 			dbgroupName := fmt.Sprintf("bg_%s", sync.Name)
-			if command == "add" {
-				dbgroupMembers := make([]string, len(sync.Bidirectional))
-				for i, dbID := range sync.Bidirectional {
-					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
-				}
-				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
-				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
-			} else { // command == "update"
-				// To ensure idempotency, we always recreate the dbgroup with a predictable name.
-				// First, delete the old one. We don't use --force, so this is safe.
-				// It will fail if a sync is using it, but that's okay because we are about to re-assign it.
-				// It will succeed if the group is orphaned or doesn't exist.
-				runBucardoCommand("del", "dbgroup", dbgroupName)
-				dbgroupMembers := make([]string, len(sync.Bidirectional))
-				for i, dbID := range sync.Bidirectional {
-					dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
-				}
-				runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
-				args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
+			dbgroupMembers := make([]string, len(sync.Bidirectional))
+			for i, dbID := range sync.Bidirectional {
+				dbgroupMembers[i] = fmt.Sprintf("db%d:source", dbID)
 			}
-		} else if len(sync.Sources) > 0 || len(sync.Targets) > 0 {
+			runBucardoCommand("del", "dbgroup", dbgroupName)
+			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbgroupMembers...)...)
+			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
+		} else {
 			syncLogger.Info("Configuring as source-to-target sync")
-			// For source-to-target syncs, we create a dbgroup with a deterministic name
-			// based on its members to ensure it's only recreated if the members change.
 			var dbStrings []string
 			var memberNames []string
 			for _, sourceID := range sync.Sources {
@@ -431,35 +516,28 @@ func addSyncsToBucardo(config *BucardoConfig) {
 				dbStrings = append(dbStrings, member)
 				memberNames = append(memberNames, member)
 			}
-			// Create a stable hash of the members to use as the group name.
 			sort.Strings(memberNames)
 			hash := sha1.Sum([]byte(strings.Join(memberNames, ",")))
-			dbgroupName := fmt.Sprintf("sg_%s_%x", sync.Name, hash[:4]) // e.g., sg_mysync_a1b2c3d4
+			dbgroupName := fmt.Sprintf("sg_%s_%x", sync.Name, hash[:4])
 
-			// Unconditionally recreate the group to ensure it's correct.
 			runBucardoCommand("del", "dbgroup", dbgroupName)
 			runBucardoCommand(append([]string{"add", "dbgroup", dbgroupName}, dbStrings...)...)
 			args = append(args, fmt.Sprintf("dbs=%s", dbgroupName))
 		}
 
-		// Tables/herds can only be set on 'add', not 'update'.
-		if command == "add" && sync.Herd != "" {
+		if sync.Herd != "" {
 			syncLogger.Info("Configuring with herd", "herd_name", sync.Herd)
 			sourceDB := fmt.Sprintf("db%d", sync.Sources[0])
 			runBucardoCommand("del", "herd", sync.Herd, "--force")
 			runBucardoCommand("add", "herd", sync.Herd)
 			runBucardoCommand("add", "all", "tables", fmt.Sprintf("--herd=%s", sync.Herd), fmt.Sprintf("db=%s", sourceDB))
 			args = append(args, fmt.Sprintf("herd=%s", sync.Herd))
-		} else if command == "add" && sync.Tables != "" {
+		} else if sync.Tables != "" {
 			syncLogger.Info("Configuring with table list")
 			args = append(args, fmt.Sprintf("tables=%s", sync.Tables))
-		} else if command == "update" && (sync.Herd != "" || sync.Tables != "") {
-			syncLogger.Warn("The 'herd' or 'tables' property cannot be changed on an existing sync. This setting will be ignored.")
 		}
 
-		// Add optional parameters to the command.
 		if sync.ExitOnComplete != nil && *sync.ExitOnComplete {
-			// stayalive=0 and kidsalive=0 ensure the sync does not persist after its initial run.
 			args = append(args, "stayalive=0", "kidsalive=0")
 		}
 		if sync.StrictChecking != nil {
@@ -469,7 +547,6 @@ func addSyncsToBucardo(config *BucardoConfig) {
 			args = append(args, fmt.Sprintf("conflict_strategy=%s", sync.ConflictStrategy))
 		}
 
-		// Execute the final bucardo command.
 		if err := runBucardoCommand(args...); err != nil {
 			syncLogger.Error("Failed to modify sync", "action", command, "error", err)
 			os.Exit(1)
@@ -483,7 +560,6 @@ func streamBucardoLog() *exec.Cmd {
 	time.Sleep(2 * time.Second)
 
 	cmd := exec.Command("tail", "-F", bucardoLogPath)
-	// Create a new process group to ensure no orphaned `tail` processes are left.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -501,7 +577,7 @@ func streamBucardoLog() *exec.Cmd {
 func startBucardo() {
 	logger.Info("Starting main Bucardo service", "component", "bucardo_service")
 	logger.Info("Checking for and stopping any stale Bucardo processes...")
-	stopBucardo() // Use our robust stop function.
+	stopBucardo()
 
 	if err := runBucardoCommand("start"); err != nil {
 		logger.Error("Failed to start bucardo", "error", err)
@@ -539,7 +615,6 @@ func monitorBucardo() {
 	if tailCmd != nil && tailCmd.Process != nil {
 		defer func() {
 			logger.Info("Stopping log streamer", "component", "log_streamer")
-			// Kill the process group to ensure tail and any children are stopped.
 			syscall.Kill(-tailCmd.Process.Pid, syscall.SIGKILL)
 		}()
 	}
@@ -585,8 +660,8 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 	}
 	cmd.Stderr = os.Stderr
 
-	ctx, cancel := context.WithCancel(context.Background()) // For stopping the scanner goroutine.
-	defer cancel()                                          // Ensure cancellation happens on function exit
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -623,16 +698,14 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 			}
 			fmt.Println(line) // Stream the log line to the container's stdout.
 
-			// Check for the completion message from the logs, e.g., "KID (sync0) Kid ... exiting at cleanup_kid.  Reason: Normal exit"
 			if strings.Contains(line, "Reason: Normal exit") {
 				for syncName := range runOnceSyncs {
 					syncLogger := logger.With("component", "run_once_monitor", "sync_name", syncName)
-					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) { // Match the log line to the sync
+					if strings.Contains(line, fmt.Sprintf("KID (%s)", syncName)) {
 						syncLogger.Info("Completion message for sync detected")
 						if err := runBucardoCommand("stop", syncName); err != nil {
 							syncLogger.Warn("Failed to stop sync after completion", "error", err)
 						}
-						// Remove from the map of syncs we are waiting for
 						delete(runOnceSyncs, syncName)
 						logger.Info("Run-once sync(s) remaining", "count", len(runOnceSyncs))
 					}
@@ -641,10 +714,10 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 
 			if len(runOnceSyncs) == 0 {
 				logger.Info("All monitored syncs have completed.")
-				if allSyncsAreRunOnce { // If all syncs were run-once, we can exit.
+				if allSyncsAreRunOnce {
 					logger.Info("All configured syncs were run-once. Shutting down container.")
-					cancel()                                        // Stop the scanner goroutine.
-					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // Kill the tail process group.
+					cancel()
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 					stopBucardo()
 					return // Success.
 				} else { // Otherwise, hand off to the standard long-running monitor.
@@ -659,7 +732,7 @@ func monitorSyncs(config *BucardoConfig, runOnceSyncs map[string]bool, maxTimeou
 			logger.Error("Timeout reached for run-once syncs", "timeout_seconds", *maxTimeout, "incomplete_syncs", getMapKeys(runOnceSyncs))
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			stopBucardo()
-			os.Exit(1) // Exit with a non-zero status code to indicate failure.
+			os.Exit(1)
 		}
 	}
 }
@@ -706,7 +779,7 @@ func removeOrphanedDbs(config *BucardoConfig) {
 	appLogger := logger.With("component", "cleanup")
 	appLogger.Info("Checking for orphaned databases to remove")
 
-	// 1. Get all database names declared in the config file (e.g., "db1", "db2").
+	// Get all database names declared in the config file (e.g., "db1", "db2").
 	configDbs := make(map[string]bool)
 	for _, db := range config.Databases {
 		dbName := fmt.Sprintf("db%d", db.ID)
@@ -720,11 +793,11 @@ func removeOrphanedDbs(config *BucardoConfig) {
 		return // Skip cleanup if we can't get the list.
 	}
 
-	// 3. Compare and delete any database from Bucardo that is not in the config.
+	// Compare and delete any database from Bucardo that is not in the config.
 	for _, bucardoDbName := range bucardoDbs {
 		if !configDbs[bucardoDbName] {
 			appLogger.Info("Removing orphaned database not found in configuration", "db_name", bucardoDbName)
-			runBucardoCommand("del", "db", bucardoDbName)
+			runBucardoCommand("del", "dbs", bucardoDbName)
 		}
 	}
 }
@@ -735,7 +808,7 @@ func removeOrphanedSyncs(config *BucardoConfig) {
 	appLogger := logger.With("component", "cleanup")
 	appLogger.Info("Checking for orphaned syncs to remove")
 
-	// 1. Get all sync names declared in the config file.
+	// Get all sync names declared in the config file.
 	configSyncs := make(map[string]bool)
 	for _, sync := range config.Syncs {
 		configSyncs[sync.Name] = true
@@ -748,7 +821,7 @@ func removeOrphanedSyncs(config *BucardoConfig) {
 		return // Skip cleanup if we can't get the list.
 	}
 
-	// 3. Compare and delete any sync from Bucardo that is not in the config.
+	// Compare and delete any sync from Bucardo that is not in the config.
 	for _, bucardoSyncName := range bucardoSyncs {
 		if !configSyncs[bucardoSyncName] {
 			appLogger.Info("Removing orphaned sync not found in configuration", "sync_name", bucardoSyncName)
@@ -758,7 +831,6 @@ func removeOrphanedSyncs(config *BucardoConfig) {
 }
 
 func main() {
-	// Use a structured JSON logger for better log management.
 	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -787,17 +859,14 @@ func main() {
 	startPostgres()
 	setLogLevel(config)
 
-	// Create the .pgpass file with all credentials for subsequent bucardo commands.
 	setupAllPgpass(config)
-	defer os.Remove(pgpassPath) // Ensure the password file is removed on exit.
+	defer os.Remove(pgpassPath)
 
 	removeOrphanedDbs(config)
 	removeOrphanedSyncs(config)
 	addDatabasesToBucardo(config)
 	addSyncsToBucardo(config)
 	startBucardo()
-
-	// --- Determine execution mode: Run-Once or Standard Long-Running ---
 
 	runOnceSyncs := make(map[string]bool)
 	var maxTimeout *int

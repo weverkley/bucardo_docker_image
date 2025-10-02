@@ -12,6 +12,7 @@ The image is designed for modern, declarative, and automated workflows. It uses 
 - **Declarative Configuration**: Define all databases and syncs in a single `bucardo.json` file.
 - **Automated Reconciliation**: On startup, the container ensures Bucardo's state matches your config, removing any orphaned databases or syncs.
 - **Multiple Execution Modes**:
+   - **Idempotent Updates**: Safely restart the container without losing data. Syncs are only re-created if their table list changes.
   - **Long-Running**: The default mode for continuous replication.
   - **Run-Once**: The container performs a single sync and then exits, ideal for batch jobs.
 - **Flexible Sync Types**:
@@ -20,6 +21,25 @@ The image is designed for modern, declarative, and automated workflows. It uses 
 - **Secure Password Management**: Load database passwords from environment variables to avoid hardcoding them in your configuration.
 - **Structured JSON Logging**: All container and Bucardo logs are emitted as structured JSON for easy parsing and monitoring.
 - **Robust Startup & Shutdown**: Graceful shutdown procedures ensure no data is lost, and the startup process cleans up any stale processes from previous runs.
+
+## Advanced Reconciliation Logic
+
+This image contains sophisticated logic to handle configuration changes gracefully and robustly.
+
+### How Sync Updates Work
+
+Bucardo's `update sync` command does not allow changing the tables associated with a sync. To solve this, the entrypoint script implements the following logic on every startup:
+
+1.  **Check for Existence**: It checks if a sync from your `bucardo.json` already exists in Bucardo.
+2.  **Compare Tables**: If the sync exists, the script inspects its current list of tables by querying the underlying `relgroup`.
+3.  **Safe Update**: If the table list in Bucardo matches your configuration, a safe, non-destructive `bucardo update sync` is performed. This applies changes to properties like `conflict_strategy` without interrupting replication or losing pending changes.
+4.  **Destructive Re-creation**: If the table list has changed, the script performs a destructive re-creation:
+    - A warning is logged, indicating that pending changes for that sync may be lost.
+    - The old `sync` is deleted.
+    - The old, now-orphaned `relgroup` is deleted to ensure a clean state.
+    - A new `sync` is created with the updated table list.
+
+This ensures that your `bucardo.json` file remains the single source of truth, and configuration changes are applied predictably.
 
 ## Quick Start with Docker Compose
 
